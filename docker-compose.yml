@@ -1,0 +1,49 @@
+version: '3.8'
+
+services:
+  mongodb:
+    image: mongo:7
+    container_name: lms-mongodb
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    environment:
+      MONGO_INITDB_DATABASE: institutional-lms
+    volumes:
+      - mongodb_data:/data/db
+    networks:
+      - lms-network
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: lms-api
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      MONGODB_URI: mongodb://mongodb:27017/institutional-lms
+      JWT_SECRET: ${JWT_SECRET:-change-this-secret-key}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:-change-this-refresh-secret-key}
+      JWT_EXPIRE: 24h
+      JWT_REFRESH_EXPIRE: 7d
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:3001}
+    volumes:
+      - ./uploads:/app/uploads
+      - ./logs:/app/logs
+    depends_on:
+      - mongodb
+    networks:
+      - lms-network
+
+volumes:
+  mongodb_data:
+
+networks:
+  lms-network:
+    driver: bridge
+
+
