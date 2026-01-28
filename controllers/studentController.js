@@ -387,6 +387,7 @@ exports.getAssessments = async (req, res, next) => {
           percentage: submission.percentage,
           passed: submission.passed,
           submittedAt: submission.submittedAt,
+          answers: submission.answers, // Include answers for result display
         } : null,
       };
     });
@@ -429,7 +430,9 @@ exports.submitAssessment = async (req, res, next) => {
     // Calculate score
     let score = 0;
     const processedAnswers = answers.map((answer, index) => {
-      const question = assessment.questions[answer.questionId];
+      // Convert questionId to number for array indexing
+      const questionIndex = parseInt(answer.questionId);
+      const question = assessment.questions[questionIndex];
       if (!question) return null;
 
       let isCorrect = false;
@@ -447,7 +450,7 @@ exports.submitAssessment = async (req, res, next) => {
       }
 
       return {
-        questionId: answer.questionId,
+        questionId: questionIndex, // Store as number for consistent comparison
         answer: answer.answer,
         isCorrect,
         marksObtained,
