@@ -348,12 +348,24 @@ router.delete('/courses/:courseId/modules/:moduleId/lessons/:lessonId', deleteLe
  *         description: Assessment created successfully
  */
 router.post('/assessments', [
-  body('courseId').notEmpty().withMessage('Course ID is required'),
-  body('title').notEmpty().withMessage('Title is required'),
-  body('questions').isArray().withMessage('Questions must be an array'),
-  body('duration').isNumeric().withMessage('Duration must be a number'),
-  body('totalMarks').isNumeric().withMessage('Total marks must be a number'),
-  body('passingMarks').isNumeric().withMessage('Passing marks must be a number'),
+  body('courseId')
+    .trim()
+    .notEmpty().withMessage('Course ID is required')
+    .isMongoId().withMessage('Invalid Course ID format'),
+  body('title')
+    .trim()
+    .notEmpty().withMessage('Title is required'),
+  body('questions')
+    .isArray({ min: 1 }).withMessage('At least one question is required'),
+  body('duration')
+    .notEmpty().withMessage('Duration is required')
+    .isNumeric().withMessage('Duration must be a number'),
+  body('totalMarks')
+    .notEmpty().withMessage('Total marks is required')
+    .isNumeric().withMessage('Total marks must be a number'),
+  body('passingMarks')
+    .notEmpty().withMessage('Passing marks is required')
+    .isNumeric().withMessage('Passing marks must be a number'),
 ], validate, createAssessment);
 router.get('/assessments', getAssessments);
 

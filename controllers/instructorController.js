@@ -370,12 +370,20 @@ exports.deleteLesson = async (req, res, next) => {
 // @access  Private/Instructor
 exports.createAssessment = async (req, res, next) => {
   try {
-    // Verify course ownership
+    // Defensive check: Ensure courseId is provided and not empty
+    if (!req.body.courseId || req.body.courseId.toString().trim() === '') {
+      return res.status(400).json({
+        success: false,
+        error: 'Course ID is required',
+      });
+    }
+
+    // Verify course exists and belongs to instructor
     const course = await Course.findById(req.body.courseId);
     if (!course) {
       return res.status(404).json({
         success: false,
-        error: 'Course not found',
+        error: 'Course not found. Please select a valid course.',
       });
     }
 
@@ -386,10 +394,20 @@ exports.createAssessment = async (req, res, next) => {
       });
     }
 
-    const assessment = await Assessment.create({
+    // Add order to questions if not provided
+    const assessmentData = {
       ...req.body,
       createdBy: req.user.id,
-    });
+    };
+
+    if (assessmentData.questions && Array.isArray(assessmentData.questions)) {
+      assessmentData.questions = assessmentData.questions.map((q, index) => ({
+        ...q,
+        order: q.order !== undefined ? q.order : index,
+      }));
+    }
+
+    const assessment = await Assessment.create(assessmentData);
 
     res.status(201).json({
       success: true,
