@@ -502,7 +502,18 @@ exports.getSubmissions = async (req, res, next) => {
 
     res.status(200).json({
       success: true,
-      data: submissions,
+      data: {
+        assessment: {
+          _id: assessment._id,
+          title: assessment.title,
+          description: assessment.description,
+          duration: assessment.duration,
+          totalMarks: assessment.totalMarks,
+          passingMarks: assessment.passingMarks,
+          questions: assessment.questions,
+        },
+        submissions,
+      },
     });
   } catch (error) {
     next(error);
