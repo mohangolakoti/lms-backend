@@ -46,11 +46,13 @@ exports.getDashboard = async (req, res, next) => {
 exports.getCourses = async (req, res, next) => {
   try {
     const courses = await Course.find({ instructorId: req.user.id })
+      .populate('batches', 'name isActive')
       .sort({ createdAt: -1 });
 
     res.status(200).json({
       success: true,
       data: courses,
+      count: courses.length,
     });
   } catch (error) {
     next(error);
@@ -62,10 +64,34 @@ exports.getCourses = async (req, res, next) => {
 // @access  Private/Instructor
 exports.createCourse = async (req, res, next) => {
   try {
+    const { batches, ...courseData } = req.body;
+
+    // Validate batches
+    if (!batches || !Array.isArray(batches) || batches.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'At least one batch must be assigned',
+      });
+    }
+
+    // Verify all batches exist
+    const Batch = require('../models/Batch');
+    const existingBatches = await Batch.find({ _id: { $in: batches } });
+
+    if (existingBatches.length !== batches.length) {
+      return res.status(400).json({
+        success: false,
+        error: 'One or more batches do not exist',
+      });
+    }
+
     const course = await Course.create({
-      ...req.body,
+      ...courseData,
+      batches,
       instructorId: req.user.id,
     });
+
+    await course.populate('batches', 'name isActive');
 
     res.status(201).json({
       success: true,

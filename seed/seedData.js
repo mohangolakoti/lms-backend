@@ -2,6 +2,7 @@ require('dotenv').config();
 const mongoose = require('mongoose');
 const User = require('../models/User');
 const Course = require('../models/Course');
+const Batch = require('../models/Batch');
 const connectDB = require('../config/database');
 
 const seedData = async () => {
@@ -11,6 +12,7 @@ const seedData = async () => {
     // Clear existing data
     await User.deleteMany({});
     await Course.deleteMany({});
+    await Batch.deleteMany({});
 
     // Create Admin
     const admin = await User.create({
@@ -42,6 +44,26 @@ const seedData = async () => {
 
     console.log('✓ Instructors created');
 
+    // Create Batches
+    // First, create older batches (inactive)
+    const batch1 = await Batch.create({
+      name: 'batch 1',
+      isActive: false,
+    });
+
+    const batch2 = await Batch.create({
+      name: 'batch 2',
+      isActive: false,
+    });
+
+    // Create the active batch (most recent)
+    const activeBatch = await Batch.create({
+      name: 'batch 3',
+      isActive: true,
+    });
+
+    console.log('✓ Batches created (Active: batch 3)');
+
     // Create Students
     const students = [];
     for (let i = 1; i <= 10; i++) {
@@ -53,11 +75,13 @@ const seedData = async () => {
         role: 'student',
         status: 'active',
         batch,
+        approvalStatus: 'approved',
+        batchId: activeBatch._id,
       });
       students.push(student);
     }
 
-    console.log('✓ Students created');
+    console.log('✓ Students created (All approved and assigned to active batch)');
 
     // Create Digital Electronics Course
     const digitalElectronicsCourse = await Course.create({
@@ -68,6 +92,7 @@ const seedData = async () => {
       thumbnailUrl: 'https://via.placeholder.com/300x200',
       visibility: 'published',
       instructorId: instructor1._id,
+      batches: [activeBatch._id, batch2._id, batch1._id],
       modules: [
         {
           title: 'Introduction',
@@ -908,8 +933,16 @@ const seedData = async () => {
     console.log(`Admin: ${admin.email} / admin123`);
     console.log(`Instructor 1: ${instructor1.email} / instructor123`);
     console.log(`Instructor 2: ${instructor2.email} / instructor123`);
-    console.log(`Students: student1@lms.com to student10@lms.com / student123`);
-    console.log(`Course: ${digitalElectronicsCourse.title}`);
+    console.log(`\nBatches:`);
+    console.log(`  - ${batch1.name} (Inactive)`);
+    console.log(`  - ${batch2.name} (Inactive)`);
+    console.log(`  - ${activeBatch.name} (Active)`);
+    console.log(`\nStudents: student1@lms.com to student10@lms.com / student123`);
+    console.log(`  - All approved and assigned to ${activeBatch.name}`);
+    console.log(`  - 5 longTerm students, 5 shortTerm students`);
+    console.log(`\nCourse: ${digitalElectronicsCourse.title}`);
+    console.log(`  - Term: both (accessible to all students)`);
+    console.log(`  - Assigned to all batches`);
 
     process.exit(0);
   } catch (error) {

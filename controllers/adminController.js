@@ -77,11 +77,12 @@ exports.getDashboard = async (req, res, next) => {
 // @access  Private/Admin
 exports.getStudents = async (req, res, next) => {
   try {
-    const { status, batch, search } = req.query;
+    const { status, batch, search, approvalStatus } = req.query;
     const query = { role: 'student' };
 
     if (status) query.status = status;
     if (batch) query.batch = batch;
+    if (approvalStatus) query.approvalStatus = approvalStatus;
     if (search) {
       query.$or = [
         { name: { $regex: search, $options: 'i' } },
@@ -91,11 +92,13 @@ exports.getStudents = async (req, res, next) => {
 
     const students = await User.find(query)
       .select('-password')
+      .populate('batchId', 'name isActive')
       .sort({ createdAt: -1 });
 
     res.status(200).json({
       success: true,
       data: students,
+      count: students.length,
     });
   } catch (error) {
     next(error);
@@ -172,10 +175,35 @@ exports.updateStudentStatus = async (req, res, next) => {
 // @access  Private/Admin
 exports.createCourse = async (req, res, next) => {
   try {
+    const { batches, ...courseData } = req.body;
+
+    // Validate batches
+    if (!batches || !Array.isArray(batches) || batches.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'At least one batch must be assigned',
+      });
+    }
+
+    // Verify all batches exist
+    const Batch = require('../models/Batch');
+    const existingBatches = await Batch.find({ _id: { $in: batches } });
+
+    if (existingBatches.length !== batches.length) {
+      return res.status(400).json({
+        success: false,
+        error: 'One or more batches do not exist',
+      });
+    }
+
     const course = await Course.create({
-      ...req.body,
+      ...courseData,
+      batches,
       instructorId: req.body.instructorId || req.user.id,
     });
+
+    await course.populate('batches', 'name isActive');
+    await course.populate('instructorId', 'name email');
 
     res.status(201).json({
       success: true,
@@ -251,11 +279,13 @@ exports.getCourses = async (req, res, next) => {
   try {
     const courses = await Course.find()
       .populate('instructorId', 'name email')
+      .populate('batches', 'name isActive')
       .sort({ createdAt: -1 });
 
     res.status(200).json({
       success: true,
       data: courses,
+      count: courses.length,
     });
   } catch (error) {
     next(error);
@@ -267,9 +297,9 @@ exports.getCourses = async (req, res, next) => {
 // @access  Private/Admin
 exports.getCourseAnalytics = async (req, res, next) => {
   try {
-    const { id } = req.params;
+    const { id, batchId } = req.params;
 
-    const course = await Course.findById(id);
+    const course = await Course.findById(id).populate('batches', 'name');
     if (!course) {
       return res.status(404).json({
         success: false,
@@ -277,7 +307,25 @@ exports.getCourseAnalytics = async (req, res, next) => {
       });
     }
 
-    const progressData = await Progress.find({ courseId: id });
+    // Get all progress entries for this course
+    let progressData = await Progress.find({ courseId: id })
+      .populate('userId', 'name email batch batchId');
+
+    // Filter by batch if batchId param provided
+    if (batchId) {
+      const batchExists = course.batches.some(b => b._id.toString() === batchId);
+      if (!batchExists) {
+        return res.status(400).json({
+          success: false,
+          error: 'Batch not assigned to this course',
+        });
+      }
+
+      progressData = progressData.filter(p => {
+        return p.userId.batchId && p.userId.batchId.toString() === batchId;
+      });
+    }
+
     const totalStudents = progressData.length;
     const completedStudents = progressData.filter(p => p.completed).length;
     const avgCompletion = progressData.length > 0
@@ -310,6 +358,7 @@ exports.getCourseAnalytics = async (req, res, next) => {
           title: course.title,
           totalModules: course.modules.length,
           totalLessons: course.modules.reduce((sum, m) => sum + m.lessons.length, 0),
+          assignedBatches: course.batches.map(b => ({ id: b._id, name: b.name })),
         },
         students: {
           totalStudents,
@@ -408,3 +457,155 @@ exports.getInstructors = async (req, res, next) => {
   }
 };
 
+// @desc    Get pending student approvals
+// @route   GET /api/admin/students/approval/pending
+// @access  Private/Admin
+exports.getPendingStudents = async (req, res, next) => {
+  try {
+    const students = await User.find({ 
+      role: 'student', 
+      approvalStatus: 'pending' 
+    })
+      .select('-password')
+      .populate('batchId', 'name')
+      .sort({ createdAt: -1 });
+
+    res.status(200).json({
+      success: true,
+      data: students,
+      count: students.length,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Approve student account
+// @route   PUT /api/admin/students/:id/approval/approve
+// @access  Private/Admin
+exports.approveStudent = async (req, res, next) => {
+  try {
+    const student = await User.findById(req.params.id);
+
+    if (!student || student.role !== 'student') {
+      return res.status(404).json({
+        success: false,
+        error: 'Student not found',
+      });
+    }
+
+    if (student.approvalStatus === 'approved') {
+      return res.status(400).json({
+        success: false,
+        error: 'Student is already approved',
+      });
+    }
+
+    student.approvalStatus = 'approved';
+    await student.save();
+
+    res.status(200).json({
+      success: true,
+      message: 'Student account approved successfully',
+      data: student,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Reject student account
+// @route   PUT /api/admin/students/:id/approval/reject
+// @access  Private/Admin
+exports.rejectStudent = async (req, res, next) => {
+  try {
+    const { reason } = req.body;
+
+    const student = await User.findById(req.params.id);
+
+    if (!student || student.role !== 'student') {
+      return res.status(404).json({
+        success: false,
+        error: 'Student not found',
+      });
+    }
+
+    if (student.approvalStatus === 'rejected') {
+      return res.status(400).json({
+        success: false,
+        error: 'Student is already rejected',
+      });
+    }
+
+    student.approvalStatus = 'rejected';
+    await student.save();
+
+    res.status(200).json({
+      success: true,
+      message: 'Student account rejected',
+      data: student,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Update student academic information
+// @route   PUT /api/admin/students/:id/update-academic
+// @access  Private/Admin
+exports.updateAcademicInfo = async (req, res, next) => {
+  try {
+    const { batchId, batch: term } = req.body;
+    const studentId = req.params.id;
+
+    // Find student
+    const student = await User.findById(studentId);
+
+    if (!student || student.role !== 'student') {
+      return res.status(404).json({
+        success: false,
+        error: 'Student not found',
+      });
+    }
+
+    // Update batch term if provided
+    if (term) {
+      if (!['longTerm', 'shortTerm'].includes(term)) {
+        return res.status(400).json({
+          success: false,
+          error: 'Invalid batch term. Must be longTerm or shortTerm',
+        });
+      }
+      student.batch = term;
+    }
+
+    // Update batchId if provided
+    if (batchId) {
+      const Batch = require('../models/Batch');
+      
+      // Verify batch exists
+      const batchExists = await Batch.findById(batchId);
+      if (!batchExists) {
+        return res.status(404).json({
+          success: false,
+          error: 'Batch not found',
+        });
+      }
+
+      student.batchId = batchId;
+    }
+
+    await student.save();
+
+    // Populate batch info
+    await student.populate('batchId', 'name isActive');
+
+    res.status(200).json({
+      success: true,
+      message: 'Student academic information updated successfully',
+      data: student,
+    });
+  } catch (error) {
+    next(error);
+  }
+};

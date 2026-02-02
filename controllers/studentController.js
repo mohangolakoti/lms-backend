@@ -12,13 +12,38 @@ const User = require('../models/User');
 exports.getDashboard = async (req, res, next) => {
   try {
     const userId = req.user.id;
-    const user = await User.findById(userId);
+    const user = await User.findById(userId).populate('batchId');
 
-    // Get courses assigned to student based on batch
+    // Check if student has batchId assigned
+    if (!user.batchId) {
+      return res.status(200).json({
+        success: true,
+        data: {
+          courses: [],
+          metrics: {
+            totalCourses: 0,
+            completedCourses: 0,
+            totalModules: 0,
+            completedModules: 0,
+            totalTimeSpent: 0,
+            totalAssessments: 0,
+            completedAssessments: 0,
+            totalQuestionsAttempted: 0,
+          },
+        },
+      });
+    }
+
+    // Get courses assigned to student based on batch AND term
     const courses = await Course.find({
-      $or: [
-        { term: user.batch },
-        { term: 'both' },
+      $and: [
+        {
+          $or: [
+            { term: user.batch },
+            { term: 'both' },
+          ],
+        },
+        { batches: user.batchId._id },
       ],
       visibility: 'published',
     }).populate('instructorId', 'name email');
@@ -106,34 +131,76 @@ exports.getDashboard = async (req, res, next) => {
 // @access  Private/Student
 exports.getCourses = async (req, res, next) => {
   try {
-    const userId = req.user.id;
-    const user = await User.findById(userId);
+    const { page, limit, sortBy, sortOrder, search } = req.query;
+    const ResponseHandler = require('../utils/responseHandler');
+    const PaginationHelper = require('../utils/paginationHelper');
+    const QueryOptimizer = require('../utils/queryOptimizer');
+    const { NotFoundError } = require('../utils/errors');
 
-    const courses = await Course.find({
-      $or: [
-        { term: user.batch },
-        { term: 'both' },
+    const userId = req.user.id;
+    const user = await User.findById(userId).populate('batchId');
+
+    if (!user) {
+      throw new NotFoundError('User');
+    }
+
+    // Check if student has batchId assigned
+    if (!user.batchId) {
+      const pagination = PaginationHelper.getPaginationMeta(0, 1, 10);
+      return ResponseHandler.paginated(res, [], pagination, 'No batch assigned yet');
+    }
+
+    // Build query: term matches OR is "both", AND batchId in course.batches
+    let query = Course.find({
+      $and: [
+        {
+          $or: [
+            { term: user.batch },
+            { term: 'both' },
+          ],
+        },
+        { batches: user.batchId._id },
       ],
       visibility: 'published',
-    })
+    });
+
+    // Add search filter if provided
+    if (search && search.trim()) {
+      query = query.find(QueryOptimizer.buildSearchFilter(search, ['title', 'description']));
+    }
+
+    // Get total count before pagination
+    const total = await Course.countDocuments(query.getFilter());
+
+    // Get pagination params
+    const { page: pageNum, limit: pageLimit, skip } = PaginationHelper.getPaginationParams(page, limit);
+
+    // Apply population, sorting, and pagination
+    const courses = await query
       .populate('instructorId', 'name email')
-      .select('-modules.lessons');
+      .populate('batches', 'name isActive')
+      .sort(QueryOptimizer.buildSort(sortBy || 'createdAt', sortOrder || -1))
+      .skip(skip)
+      .limit(pageLimit)
+      .select('-modules.lessons')
+      .lean();
 
-    const progressData = await Progress.find({ userId });
+    // Fetch progress data
+    const progressData = await Progress.find({ userId }).lean();
 
+    // Merge progress into courses
     const coursesWithProgress = courses.map(course => {
       const progress = progressData.find(p => p.courseId.toString() === course._id.toString());
       return {
-        ...course.toObject(),
+        ...course,
         progress: progress ? progress.overallCoursePercentage : 0,
         completed: progress ? progress.completed : false,
       };
     });
 
-    res.status(200).json({
-      success: true,
-      data: coursesWithProgress,
-    });
+    const pagination = PaginationHelper.getPaginationMeta(total, pageNum, pageLimit);
+
+    return ResponseHandler.paginated(res, coursesWithProgress, pagination);
   } catch (error) {
     next(error);
   }
@@ -146,22 +213,45 @@ exports.getCourseDetails = async (req, res, next) => {
   try {
     const { courseId } = req.params;
     const userId = req.user.id;
+    const ResponseHandler = require('../utils/responseHandler');
+    const { NotFoundError, ForbiddenError, ValidationError } = require('../utils/errors');
 
-    const course = await Course.findById(courseId)
-      .populate('instructorId', 'name email');
+    // Fetch user with batchId
+    const user = await User.findById(userId).populate('batchId');
 
-    if (!course) {
-      return res.status(404).json({
-        success: false,
-        error: 'Course not found',
-      });
+    if (!user) {
+      throw new NotFoundError('User');
     }
 
-    // Get or create progress
+    const course = await Course.findById(courseId)
+      .populate('instructorId', 'name email')
+      .populate('batches', 'name isActive');
+
+    if (!course) {
+      throw new NotFoundError('Course');
+    }
+
+    // Check batch access
+    if (!user.batchId) {
+      throw new ForbiddenError('No batch assigned. Unable to access courses.');
+    }
+
+    // Verify term match
+    const termMatch = course.term === user.batch || course.term === 'both';
+    if (!termMatch) {
+      throw new ForbiddenError('Course not available for your batch term');
+    }
+
+    // Verify batch is in course batches
+    const batchInCourse = course.batches.some(b => b._id.toString() === user.batchId._id.toString());
+    if (!batchInCourse) {
+      throw new ForbiddenError('You do not have access to this course');
+    }
+
+    // Get or create progress (avoid N+1 queries)
     let progress = await Progress.findOne({ userId, courseId });
 
     if (!progress) {
-      // Initialize progress
       progress = await Progress.create({
         userId,
         courseId,

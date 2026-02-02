@@ -5,6 +5,10 @@ const {
   getStudents,
   getStudent,
   updateStudentStatus,
+  getPendingStudents,
+  approveStudent,
+  rejectStudent,
+  updateAcademicInfo,
   createCourse,
   updateCourse,
   deleteCourse,
@@ -54,6 +58,11 @@ router.get('/dashboard', getDashboard);
  *         schema:
  *           type: string
  *           enum: [longTerm, shortTerm]
+ *       - in: query
+ *         name: approvalStatus
+ *         schema:
+ *           type: string
+ *           enum: [pending, approved, rejected]
  *       - in: query
  *         name: search
  *         schema:
@@ -117,6 +126,159 @@ router.get('/students/:id', getStudent);
 router.put('/students/:id/status', [
   body('status').isIn(['active', 'blocked']).withMessage('Status must be active or blocked'),
 ], validate, updateStudentStatus);
+
+/**
+ * @swagger
+ * /api/admin/students/approval/pending:
+ *   get:
+ *     summary: Get pending student approvals
+ *     tags: [Admin]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: List of pending students
+ */
+router.get('/students/approval/pending', getPendingStudents);
+
+/**
+ * @swagger
+ * /api/admin/students/{id}/approval/approve:
+ *   put:
+ *     summary: Approve student account
+ *     tags: [Admin]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: Student account approved
+ */
+router.put('/students/:id/approval/approve', approveStudent);
+
+/**
+ * @swagger
+ * /api/admin/students/{id}/approval/reject:
+ *   put:
+ *     summary: Reject student account
+ *     tags: [Admin]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *     requestBody:
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               reason:
+ *                 type: string
+ *     responses:
+ *       200:
+ *         description: Student account rejected
+ */
+router.put('/students/:id/approval/reject', rejectStudent);
+
+/**
+ * @swagger
+ * /api/admin/students/{id}/approve:
+ *   put:
+ *     summary: Approve student account (alternative path)
+ *     tags: [Admin]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: Student account approved
+ */
+router.put('/students/:id/approve', approveStudent);
+
+/**
+ * @swagger
+ * /api/admin/students/{id}/reject:
+ *   put:
+ *     summary: Reject student account (alternative path)
+ *     tags: [Admin]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *     requestBody:
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               reason:
+ *                 type: string
+ *     responses:
+ *       200:
+ *         description: Student account rejected
+ */
+router.put('/students/:id/reject', rejectStudent);
+
+/**
+ * @swagger
+ * /api/admin/students/{id}/update-academic:
+ *   put:
+ *     summary: Update student academic information (term and batch)
+ *     tags: [Admin]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               batch:
+ *                 type: string
+ *                 enum: [longTerm, shortTerm]
+ *                 description: Student batch term
+ *               batchId:
+ *                 type: string
+ *                 description: MongoDB ObjectId of the Batch
+ *     responses:
+ *       200:
+ *         description: Student academic information updated
+ */
+router.put('/students/:id/update-academic', [
+  body('batch')
+    .optional()
+    .isIn(['longTerm', 'shortTerm'])
+    .withMessage('Batch term must be longTerm or shortTerm'),
+  body('batchId')
+    .optional()
+    .isMongoId()
+    .withMessage('Invalid batchId format'),
+], validate, updateAcademicInfo);
 
 /**
  * @swagger

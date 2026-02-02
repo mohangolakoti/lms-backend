@@ -1,8 +1,11 @@
 const crypto = require('crypto');
 const User = require('../models/User');
+const Batch = require('../models/Batch');
 const { generateToken, generateRefreshToken } = require('../utils/generateToken');
 const sendEmail = require('../utils/sendEmail');
 const logger = require('../utils/logger');
+const ResponseHandler = require('../utils/responseHandler');
+const { ValidationError, ConflictError, NotFoundError, UnauthorizedError, ForbiddenError } = require('../utils/errors');
 
 // @desc    Register user
 // @route   POST /api/auth/register
@@ -11,34 +14,77 @@ exports.register = async (req, res, next) => {
   try {
     const { name, email, password, mobile, role, batch } = req.body;
 
+    // Validation
+    if (!name || !email || !password) {
+      throw new ValidationError('Name, email, and password are required');
+    }
+
+    if (password.length < 6) {
+      throw new ValidationError('Password must be at least 6 characters');
+    }
+
     // Check if user exists
-    const userExists = await User.findOne({ email });
+    const userExists = await User.findOne({ email: email.toLowerCase() });
     if (userExists) {
-      return res.status(400).json({
-        success: false,
-        error: 'User already exists',
-      });
+      throw new ConflictError('User with this email already exists');
+    }
+
+    // Prepare user data
+    const userData = {
+      name: name.trim(),
+      email: email.toLowerCase().trim(),
+      password,
+      mobile: mobile?.trim() || '',
+      role: role || 'student',
+    };
+
+    // For student role: auto-assign active batch and set approvalStatus
+    if (userData.role === 'student') {
+      // Validate batch parameter for students
+      if (!batch || !['longTerm', 'shortTerm'].includes(batch)) {
+        throw new ValidationError('Valid batch term (longTerm or shortTerm) is required for students');
+      }
+
+      // Get the latest active batch
+      const activeBatch = await Batch.findOne({ isActive: true, isDeleted: false })
+        .sort({ createdAt: -1 });
+      
+      if (!activeBatch) {
+        throw new NotFoundError('No active batch available for student registration');
+      }
+
+      userData.batch = batch;
+      userData.batchId = activeBatch._id;
+      userData.approvalStatus = 'pending'; // Students are pending by default
     }
 
     // Create user
-    const user = await User.create({
-      name,
-      email,
-      password,
-      mobile,
-      role: role || 'student',
-      batch: role === 'student' ? batch : undefined,
-    });
+    const user = await User.create(userData);
 
+    logger.info(`New user registered: ${user._id} with role: ${user.role}`);
+
+    // For students, do NOT return token (pending approval)
+    if (user.role === 'student') {
+      return ResponseHandler.created(res, {
+        user: {
+          id: user._id,
+          name: user.name,
+          email: user.email,
+          role: user.role,
+          batch: user.batch,
+          approvalStatus: user.approvalStatus,
+        },
+      }, 'Registration successful. Your account is pending admin approval.');
+    }
+
+    // For admin/instructor, return token immediately
     const token = generateToken(user._id);
     const refreshToken = generateRefreshToken(user._id);
 
-    res.status(201).json({
-      success: true,
-      data: {
-        token,
-        refreshToken,
-        user: {
+    return ResponseHandler.created(res, {
+      token,
+      refreshToken,
+      user: {
           id: user._id,
           name: user.name,
           email: user.email,
@@ -46,7 +92,7 @@ exports.register = async (req, res, next) => {
           batch: user.batch,
         },
       },
-    });
+     'Registration successful');
   } catch (error) {
     next(error);
   }
@@ -59,64 +105,69 @@ exports.login = async (req, res, next) => {
   try {
     const { email, password } = req.body;
 
-    // Validate email & password
+    // Validate inputs
     if (!email || !password) {
-      return res.status(400).json({
-        success: false,
-        error: 'Please provide email and password',
-      });
+      throw new ValidationError('Email and password are required');
     }
 
-    // Check for user
-    const user = await User.findOne({ email }).select('+password');
+    // Find user with password field
+    const user = await User.findOne({ email: email.toLowerCase() })
+      .select('+password')
+      .populate('batchId', 'name isActive');
 
     if (!user) {
-      return res.status(401).json({
-        success: false,
-        error: 'Invalid credentials',
-      });
+      throw new UnauthorizedError('Invalid email or password');
     }
 
     // Check if user is blocked
     if (user.status === 'blocked') {
-      return res.status(403).json({
-        success: false,
-        error: 'Your account has been blocked. Please contact administrator.',
-      });
+      logger.warn(`Login attempt by blocked user: ${user._id}`);
+      throw new ForbiddenError('Your account has been blocked. Please contact administrator.');
     }
 
-    // Check if password matches
-    const isMatch = await user.matchPassword(password);
+    // Check approval status for students
+    if (user.role === 'student') {
+      if (user.approvalStatus === 'rejected') {
+        logger.warn(`Login attempt by rejected student: ${user._id}`);
+        throw new ForbiddenError('Your account has been rejected. Please contact administrator.');
+      }
 
+      if (user.approvalStatus !== 'approved') {
+        logger.info(`Login attempt by pending student: ${user._id}`);
+        throw new ForbiddenError('Account pending admin approval');
+      }
+    }
+
+    // Verify password
+    const isMatch = await user.matchPassword(password);
     if (!isMatch) {
-      return res.status(401).json({
-        success: false,
-        error: 'Invalid credentials',
-      });
+      logger.warn(`Failed login attempt for user: ${user._id}`);
+      throw new UnauthorizedError('Invalid email or password');
     }
 
     // Update last login
-    user.lastLogin = Date.now();
+    user.lastLogin = new Date();
     await user.save();
+
+    logger.info(`User logged in: ${user._id}`);
 
     const token = generateToken(user._id);
     const refreshToken = generateRefreshToken(user._id);
 
-    res.status(200).json({
-      success: true,
-      data: {
-        token,
-        refreshToken,
-        user: {
-          id: user._id,
-          name: user.name,
-          email: user.email,
-          role: user.role,
-          batch: user.batch,
-          avatarUrl: user.avatarUrl,
-        },
+    return ResponseHandler.success(res, {
+      token,
+      refreshToken,
+      user: {
+        id: user._id,
+        name: user.name,
+        email: user.email,
+        role: user.role,
+        batch: user.batch,
+        batchId: user.batchId?._id,
+        avatarUrl: user.avatarUrl,
+        approvalStatus: user.approvalStatus,
       },
-    });
+    }, 'Login successful');
   } catch (error) {
     next(error);
   }
