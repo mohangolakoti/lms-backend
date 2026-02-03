@@ -7,35 +7,54 @@ class ResponseHandler {
    * Success response
    */
   static success(res, data, message = 'Success', statusCode = 200) {
-    return res.status(statusCode).json({
+    if (res.headersSent) {
+      console.error('ResponseHandler.success: Headers already sent');
+      return res;
+    }
+    
+    res.status(statusCode).json({
       success: true,
       message,
       data,
       timestamp: new Date().toISOString(),
     });
+    
+    return res;
   }
 
   /**
    * Error response
    */
   static error(res, error, statusCode = 500, additionalData = null) {
+    if (res.headersSent) {
+      console.error('ResponseHandler.error: Headers already sent');
+      return res;
+    }
+    
     const message = error?.message || 'Internal server error';
     const isDevelopment = process.env.NODE_ENV === 'development';
 
-    return res.status(statusCode).json({
+    res.status(statusCode).json({
       success: false,
       message,
       error: isDevelopment ? error?.stack : undefined,
       data: additionalData,
       timestamp: new Date().toISOString(),
     });
+    
+    return res;
   }
 
   /**
    * Paginated response
    */
   static paginated(res, data, pagination, message = 'Success', statusCode = 200) {
-    return res.status(statusCode).json({
+    if (res.headersSent) {
+      console.error('ResponseHandler.paginated: Headers already sent');
+      return res;
+    }
+    
+    res.status(statusCode).json({
       success: true,
       message,
       data,
@@ -49,6 +68,8 @@ class ResponseHandler {
       },
       timestamp: new Date().toISOString(),
     });
+    
+    return res;
   }
 
   /**
@@ -62,7 +83,14 @@ class ResponseHandler {
    * No content response
    */
   static noContent(res) {
-    return res.status(204).send();
+    if (res.headersSent) {
+      console.error('ResponseHandler.noContent: Headers already sent');
+      return res;
+    }
+    
+    res.status(204).send();
+    
+    return res;
   }
 }
 

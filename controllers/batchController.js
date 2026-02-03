@@ -1,5 +1,5 @@
 const Batch = require('../models/Batch');
-const { logger } = require('../utils/logger');
+const logger = require('../utils/logger');
 const ResponseHandler = require('../utils/responseHandler');
 const PaginationHelper = require('../utils/paginationHelper');
 const QueryOptimizer = require('../utils/queryOptimizer');
