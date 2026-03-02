@@ -15,6 +15,8 @@ const {
   getCourses,
   getCourseAnalytics,
   createAnnouncement,
+  getAnnouncements,
+  deleteAnnouncement,
   getInstructors,
 } = require('../controllers/adminController');
 const { protect, authorize } = require('../middleware/auth');
@@ -397,6 +399,29 @@ router.get('/courses/:id/analytics', getCourseAnalytics);
 /**
  * @swagger
  * /api/admin/announcements:
+ *   get:
+ *     summary: Get all announcements
+ *     tags: [Admin]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: page
+ *         schema:
+ *           type: integer
+ *           default: 1
+ *       - in: query
+ *         name: limit
+ *         schema:
+ *           type: integer
+ *           default: 10
+ *       - in: query
+ *         name: search
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: List of announcements with pagination
  *   post:
  *     summary: Create announcement
  *     tags: [Admin]
@@ -411,28 +436,57 @@ router.get('/courses/:id/analytics', getCourseAnalytics);
  *             required:
  *               - title
  *               - message
- *               - target
+ *               - targetType
+ *               - deliveryChannels
  *             properties:
  *               title:
  *                 type: string
  *               message:
  *                 type: string
- *               target:
+ *               targetType:
  *                 type: string
- *                 enum: [global, course]
- *               courseId:
- *                 type: string
- *               pinned:
- *                 type: boolean
+ *                 enum: [global, batch]
+ *               batchIds:
+ *                 type: array
+ *                 items:
+ *                   type: string
+ *               deliveryChannels:
+ *                 type: array
+ *                 items:
+ *                   type: string
+ *                   enum: [email, whatsapp, portal]
  *     responses:
  *       201:
  *         description: Announcement created successfully
  */
+router.get('/announcements', getAnnouncements);
 router.post('/announcements', [
   body('title').notEmpty().withMessage('Title is required'),
   body('message').notEmpty().withMessage('Message is required'),
-  body('target').isIn(['global', 'course']).withMessage('Target must be global or course'),
+  body('targetType').isIn(['global', 'batch']).withMessage('Target type must be global or batch'),
+  body('deliveryChannels').isArray({ min: 1 }).withMessage('At least one delivery channel is required'),
+  body('deliveryChannels.*').isIn(['email', 'whatsapp', 'portal']).withMessage('Invalid delivery channel'),
 ], validate, createAnnouncement);
+
+/**
+ * @swagger
+ * /api/admin/announcements/{id}:
+ *   delete:
+ *     summary: Delete announcement
+ *     tags: [Admin]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: Announcement deleted successfully
+ */
+router.delete('/announcements/:id', deleteAnnouncement);
 
 /**
  * @swagger

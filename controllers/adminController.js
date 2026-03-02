@@ -5,6 +5,10 @@ const Assessment = require('../models/Assessment');
 const Submission = require('../models/Submission');
 const Announcement = require('../models/Announcement');
 const Notification = require('../models/Notification');
+const Batch = require('../models/Batch');
+const sendEmail = require('../utils/sendEmail');
+const { sendBatchWhatsAppMessages } = require('../utils/whatsappService');
+const logger = require('../utils/logger');
 
 // @desc    Get admin dashboard stats
 // @route   GET /api/admin/dashboard
@@ -383,57 +387,280 @@ exports.getCourseAnalytics = async (req, res, next) => {
 // @access  Private/Admin
 exports.createAnnouncement = async (req, res, next) => {
   try {
+    const { title, message, targetType, batchIds, deliveryChannels } = req.body;
+
+    // Validation
+    if (!deliveryChannels || deliveryChannels.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'At least one delivery channel must be selected',
+      });
+    }
+
+    if (targetType === 'batch' && (!batchIds || batchIds.length === 0)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Batch IDs are required for batch-specific announcements',
+      });
+    }
+
+    if (targetType === 'global' && batchIds && batchIds.length > 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'Batch IDs must be empty for global announcements',
+      });
+    }
+
+    // Create announcement
     const announcement = await Announcement.create({
-      ...req.body,
+      title,
+      message,
+      targetType,
+      batchIds: targetType === 'batch' ? batchIds : [],
+      deliveryChannels,
       createdBy: req.user.id,
     });
 
-    // Create notifications for target users
-    if (announcement.target === 'global') {
-      const students = await User.find({ role: 'student', status: 'active' });
-      if (students.length > 0) {
-        const notifications = students.map(student => ({
-          userId: student._id,
-          type: 'announcement',
-          title: announcement.title,
-          message: announcement.message,
-          payload: { announcementId: announcement._id },
-        }));
-        await Notification.insertMany(notifications);
-      }
-    } else if (announcement.target === 'course') {
-      const course = await Course.findById(announcement.courseId);
-      if (course) {
-        // Find students matching the course term
-        const query = {
-          role: 'student',
-          status: 'active',
-        };
-        
-        if (course.term === 'both') {
-          // All students can access
-        } else {
-          query.batch = course.term;
-        }
+    // Determine target students based on targetType
+    let targetStudents = [];
 
-        const students = await User.find(query);
-        
-        if (students.length > 0) {
-          const notifications = students.map(student => ({
-            userId: student._id,
-            type: 'announcement',
-            title: announcement.title,
-            message: announcement.message,
-            payload: { announcementId: announcement._id, courseId: course._id },
-          }));
-          await Notification.insertMany(notifications);
-        }
-      }
+    if (targetType === 'global') {
+      // Get all active, approved students
+      targetStudents = await User.find({
+        role: 'student',
+        status: 'active',
+        approvalStatus: 'approved',
+      }).select('_id email name phoneNumber batchId');
+    } else if (targetType === 'batch') {
+      // Get students in specified batches
+      targetStudents = await User.find({
+        role: 'student',
+        status: 'active',
+        approvalStatus: 'approved',
+        batchId: { $in: batchIds },
+      }).select('_id email name phoneNumber batchId');
     }
+
+    logger.info(`Announcement targeting ${targetStudents.length} students`);
+
+    // Process delivery channels asynchronously (non-blocking)
+    // Do NOT await these - return success immediately after DB save
+    handleAnnouncementDelivery(announcement, targetStudents, deliveryChannels).catch(
+      error => logger.error('Error in announcement delivery:', error)
+    );
+
+    // Populate references for response
+    const populatedAnnouncement = await Announcement.findById(announcement._id)
+      .populate('createdBy', 'name email')
+      .populate('batchIds', 'name');
 
     res.status(201).json({
       success: true,
-      data: announcement,
+      data: populatedAnnouncement,
+      message: 'Announcement created successfully. Notifications are being sent.',
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Handle async delivery of announcement through multiple channels
+ * This runs in the background without blocking the HTTP response
+ */
+async function handleAnnouncementDelivery(announcement, targetStudents, deliveryChannels) {
+  // Process all channels in parallel
+  const deliveryPromises = [];
+
+  if (deliveryChannels.includes('portal')) {
+    deliveryPromises.push(
+      handlePortalDelivery(announcement, targetStudents)
+    );
+  }
+
+  if (deliveryChannels.includes('email')) {
+    deliveryPromises.push(
+      handleEmailDelivery(announcement, targetStudents)
+    );
+  }
+
+  if (deliveryChannels.includes('whatsapp')) {
+    deliveryPromises.push(
+      handleWhatsAppDelivery(announcement, targetStudents)
+    );
+  }
+
+  // Execute all channels in parallel for scalability
+  const results = await Promise.allSettled(deliveryPromises);
+
+  results.forEach((result, index) => {
+    const channel = deliveryChannels[index];
+    if (result.status === 'rejected') {
+      logger.error(`Failed to deliver via ${channel}:`, result.reason);
+    } else {
+      logger.info(`Successfully handled ${channel} delivery:`, result.value);
+    }
+  });
+}
+
+/**
+ * Create portal notifications for each student
+ * This is fast and can be done synchronously within batch operations
+ */
+async function handlePortalDelivery(announcement, targetStudents) {
+  if (targetStudents.length === 0) {
+    return { channel: 'portal', sent: 0 };
+  }
+
+  const notifications = targetStudents.map(student => ({
+    userId: student._id,
+    type: 'announcement',
+    title: announcement.title,
+    message: announcement.message,
+    payload: {
+      announcementId: announcement._id,
+      targetType: announcement.targetType,
+    },
+  }));
+
+  await Notification.insertMany(notifications);
+  logger.info(`Portal: Created ${notifications.length} notifications`);
+
+  return { channel: 'portal', sent: notifications.length };
+}
+
+/**
+ * Send emails asynchronously for scalability
+ * Uses Promise.all for parallel email sending
+ */
+async function handleEmailDelivery(announcement, targetStudents) {
+  if (targetStudents.length === 0) {
+    return { channel: 'email', sent: 0, failed: 0 };
+  }
+
+  const emailPromises = targetStudents.map(student =>
+    sendEmail({
+      email: student.email,
+      subject: `New Announcement: ${announcement.title}`,
+      html: `
+        <h2>${announcement.title}</h2>
+        <p>Dear ${student.name},</p>
+        <p>${announcement.message}</p>
+        <p>Regards,<br>LMS Administration</p>
+      `,
+      message: announcement.message,
+    }).catch(error => {
+      logger.warn(`Failed to send email to ${student.email}:`, error.message);
+      return null;
+    })
+  );
+
+  const results = await Promise.all(emailPromises);
+  const successCount = results.filter(r => r !== null).length;
+  const failureCount = results.filter(r => r === null).length;
+
+  logger.info(`Email: Sent to ${successCount}, Failed: ${failureCount}`);
+
+  return { channel: 'email', sent: successCount, failed: failureCount };
+}
+
+/**
+ * Send WhatsApp messages asynchronously
+ * Uses WhatsApp service for message delivery
+ */
+async function handleWhatsAppDelivery(announcement, targetStudents) {
+  if (targetStudents.length === 0) {
+    return { channel: 'whatsapp', sent: 0, failed: 0 };
+  }
+
+  // Filter students with phone numbers
+  const studentsWithPhone = targetStudents.filter(s => s.phoneNumber);
+
+  if (studentsWithPhone.length === 0) {
+    logger.info('WhatsApp: No students with phone numbers');
+    return { channel: 'whatsapp', sent: 0, failed: 0 };
+  }
+
+  const messages = studentsWithPhone.map(student => ({
+    phoneNumber: student.phoneNumber,
+    title: announcement.title,
+    message: announcement.message,
+  }));
+
+  const result = await sendBatchWhatsAppMessages(messages);
+
+  logger.info(`WhatsApp: Sent to ${result.successful}, Failed: ${result.failed}`);
+
+  return { channel: 'whatsapp', sent: result.successful, failed: result.failed };
+}
+
+// @desc    Get all announcements
+// @route   GET /api/admin/announcements
+// @access  Private/Admin
+exports.getAnnouncements = async (req, res, next) => {
+  try {
+    const { page = 1, limit = 10, search } = req.query;
+    const skip = (page - 1) * limit;
+
+    const query = {};
+    if (search) {
+      query.$or = [
+        { title: { $regex: search, $options: 'i' } },
+        { message: { $regex: search, $options: 'i' } },
+      ];
+    }
+
+    const announcements = await Announcement.find(query)
+      .populate('createdBy', 'name email')
+      .populate('batchIds', 'name')
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(parseInt(limit));
+
+    const total = await Announcement.countDocuments(query);
+
+    res.status(200).json({
+      success: true,
+      data: announcements,
+      pagination: {
+        current: parseInt(page),
+        limit: parseInt(limit),
+        total,
+        pages: Math.ceil(total / limit),
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Delete announcement (soft delete)
+// @route   DELETE /api/admin/announcements/:id
+// @access  Private/Admin
+exports.deleteAnnouncement = async (req, res, next) => {
+  try {
+    const announcement = await Announcement.findById(req.params.id);
+
+    if (!announcement) {
+      return res.status(404).json({
+        success: false,
+        error: 'Announcement not found',
+      });
+    }
+
+    // Soft delete the announcement
+    await announcement.softDelete();
+
+    // Remove associated portal notifications
+    await Notification.deleteMany({
+      'payload.announcementId': announcement._id,
+    });
+
+    logger.info(`Announcement ${announcement._id} and its notifications deleted`);
+
+    res.status(200).json({
+      success: true,
+      message: 'Announcement deleted successfully',
     });
   } catch (error) {
     next(error);
