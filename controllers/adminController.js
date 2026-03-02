@@ -77,11 +77,12 @@ exports.getDashboard = async (req, res, next) => {
 // @access  Private/Admin
 exports.getStudents = async (req, res, next) => {
   try {
-    const { status, batch, search, approvalStatus } = req.query;
+    const { status, batch, search, approvalStatus, batchId } = req.query;
     const query = { role: 'student' };
 
     if (status) query.status = status;
     if (batch) query.batch = batch;
+    if (batchId) query.batchId = batchId; // Filter by batch ID
     if (approvalStatus) query.approvalStatus = approvalStatus;
     if (search) {
       query.$or = [

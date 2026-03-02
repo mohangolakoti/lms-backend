@@ -82,12 +82,13 @@ router.get('/dashboard', getDashboard);
  *         description: Course created successfully
  */
 router.get('/courses', getCourses);
+// POST courses only allowed for admin - instructors can only view and manage their assigned courses
 router.post('/courses', [
   body('title').notEmpty().withMessage('Title is required'),
   body('description').notEmpty().withMessage('Description is required'),
   body('term').isIn(['longTerm', 'shortTerm', 'both']).withMessage('Invalid term'),
   body('level').isIn(['Beginner', 'Intermediate', 'Advanced']).withMessage('Invalid level'),
-], validate, createCourse);
+], validate, authorize('admin'), createCourse);
 
 /**
  * @swagger
