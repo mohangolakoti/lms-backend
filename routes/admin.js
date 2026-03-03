@@ -17,6 +17,7 @@ const {
   createAnnouncement,
   getAnnouncements,
   deleteAnnouncement,
+  createInstructor,
   getInstructors,
 } = require('../controllers/adminController');
 const { protect, authorize } = require('../middleware/auth');
@@ -491,6 +492,33 @@ router.delete('/announcements/:id', deleteAnnouncement);
 /**
  * @swagger
  * /api/admin/instructors:
+*   post:
+*     summary: Create a new instructor
+*     tags: [Admin]
+*     security:
+*       - bearerAuth: []
+*     requestBody:
+*       required: true
+*       content:
+*         application/json:
+*           schema:
+*             type: object
+*             required:
+*               - name
+*               - email
+*             properties:
+*               name:
+*                 type: string
+*               email:
+*                 type: string
+*                 format: email
+*               mobile:
+*                 type: string
+*     responses:
+*       201:
+*         description: Instructor created successfully
+*       409:
+*         description: Email already exists
  *   get:
  *     summary: Get all instructors
  *     tags: [Admin]
@@ -500,6 +528,11 @@ router.delete('/announcements/:id', deleteAnnouncement);
  *       200:
  *         description: List of instructors
  */
+router.post('/instructors', [
+  body('name').trim().notEmpty().withMessage('Name is required'),
+  body('email').isEmail().withMessage('Please provide a valid email'),
+  body('mobile').optional().trim(),
+], validate, createInstructor);
 router.get('/instructors', getInstructors);
 
 module.exports = router;

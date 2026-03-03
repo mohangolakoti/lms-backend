@@ -29,13 +29,19 @@ exports.register = async (req, res, next) => {
       throw new ConflictError('User with this email already exists');
     }
 
+    // Prevent instructor self-registration - only admin and students can register
+    const requestedRole = role || 'student';
+    if (requestedRole === 'instructor') {
+      throw new ForbiddenError('Instructors cannot self-register. Only admins can create instructor accounts.');
+    }
+
     // Prepare user data
     const userData = {
       name: name.trim(),
       email: email.toLowerCase().trim(),
       password,
       mobile: mobile?.trim() || '',
-      role: role || 'student',
+      role: requestedRole,
     };
 
     // For student role: auto-assign active batch and set approvalStatus

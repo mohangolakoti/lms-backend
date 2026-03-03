@@ -9,6 +9,8 @@ const Batch = require('../models/Batch');
 const sendEmail = require('../utils/sendEmail');
 const { sendBatchWhatsAppMessages } = require('../utils/whatsappService');
 const logger = require('../utils/logger');
+const crypto = require('crypto');
+const bcrypt = require('bcryptjs');
 
 // @desc    Get admin dashboard stats
 // @route   GET /api/admin/dashboard
@@ -666,6 +668,96 @@ exports.deleteAnnouncement = async (req, res, next) => {
     next(error);
   }
 };
+
+  // @desc    Create instructor (admin only)
+  // @route   POST /api/admin/instructors
+  // @access  Private/Admin
+  exports.createInstructor = async (req, res, next) => {
+    try {
+      const { name, email, mobile } = req.body;
+
+      // Validate required fields
+      if (!name || !email) {
+        return res.status(400).json({
+          success: false,
+          error: 'Name and email are required',
+        });
+      }
+
+      // Validate email format
+      const emailRegex = /^\w+([.-]?\w+)*@\w+([.-]?\w+)*(\.\w{2,3})+$/;
+      if (!emailRegex.test(email)) {
+        return res.status(400).json({
+          success: false,
+          error: 'Please provide a valid email',
+        });
+      }
+
+      // Check if email already exists
+      const existingUser = await User.findOne({ email: email.toLowerCase() });
+      if (existingUser) {
+        return res.status(409).json({
+          success: false,
+          error: 'User with this email already exists',
+        });
+      }
+
+      // Generate random password (8-12 characters)
+      const passwordLength = Math.floor(Math.random() * 5) + 8; // 8-12 chars
+      const generatedPassword = crypto.randomBytes(passwordLength).toString('hex').slice(0, passwordLength);
+
+      // Create instructor
+      const instructor = await User.create({
+        name: name.trim(),
+        email: email.toLowerCase().trim(),
+        password: generatedPassword,
+        mobile: mobile?.trim() || '',
+        role: 'instructor',
+        status: 'active',
+        approvalStatus: 'approved', // Instructors are auto-approved when created by admin
+      });
+
+      logger.info(`Instructor created by admin: ${instructor._id}`);
+
+      // Send email with credentials (async, don't wait)
+      const emailSubject = 'Your Instructor Account Created';
+      const emailHtml = `
+        <h2>Welcome to the LMS</h2>
+        <p>Your instructor account has been created successfully.</p>
+        <h3>Login Credentials:</h3>
+        <p><strong>Email:</strong> ${email}</p>
+        <p><strong>Password:</strong> ${generatedPassword}</p>
+        <p><strong>Login URL:</strong> ${process.env.FRONTEND_URL || 'http://localhost:3001'}/login</p>
+        <hr />
+        <p>Please change your password after your first login for security.</p>
+        <p>If you have any issues, contact the administrator.</p>
+      `;
+
+      sendEmail({
+        email: email,
+        subject: emailSubject,
+        html: emailHtml,
+      }).catch(err => {
+        logger.error(`Failed to send instructor credentials email to ${email}: ${err.message}`);
+      });
+
+      res.status(201).json({
+        success: true,
+        message: 'Instructor created successfully and credentials sent via email',
+        data: {
+          id: instructor._id,
+          name: instructor.name,
+          email: instructor.email,
+          mobile: instructor.mobile,
+          role: instructor.role,
+          status: instructor.status,
+          createdAt: instructor.createdAt,
+        },
+      });
+    } catch (error) {
+      next(error);
+    }
+  };
 
 // @desc    Get all instructors
 // @route   GET /api/admin/instructors
