@@ -6,11 +6,36 @@ const Submission = require('../models/Submission');
 const Announcement = require('../models/Announcement');
 const Notification = require('../models/Notification');
 const Batch = require('../models/Batch');
+const CourseInstructor = require('../models/CourseInstructor');
 const sendEmail = require('../utils/sendEmail');
 const { sendBatchWhatsAppMessages } = require('../utils/whatsappService');
 const logger = require('../utils/logger');
+const {
+  normalizeAssignments,
+  buildPrimaryInstructorId,
+  syncCourseInstructors,
+  getCourseAssignmentsMap,
+} = require('../utils/courseInstructorService');
 const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
+
+const validateInstructorAssignments = async (assignments = []) => {
+  if (!assignments.length) {
+    return 'At least one instructor must be assigned';
+  }
+
+  const instructorIds = assignments.map((item) => item.instructorId);
+  const instructors = await User.find({
+    _id: { $in: instructorIds },
+    role: 'instructor',
+  }).select('_id');
+
+  if (instructors.length !== assignments.length) {
+    return 'One or more assigned instructors are invalid';
+  }
+
+  return null;
+};
 
 // @desc    Get admin dashboard stats
 // @route   GET /api/admin/dashboard
@@ -182,7 +207,7 @@ exports.updateStudentStatus = async (req, res, next) => {
 // @access  Private/Admin
 exports.createCourse = async (req, res, next) => {
   try {
-    const { batches, ...courseData } = req.body;
+    const { batches, courseInstructors, instructorId, ...courseData } = req.body;
 
     // Validate batches
     if (!batches || !Array.isArray(batches) || batches.length === 0) {
@@ -203,18 +228,38 @@ exports.createCourse = async (req, res, next) => {
       });
     }
 
+    const normalizedAssignments = normalizeAssignments(courseInstructors, instructorId || req.user.id);
+    const assignmentError = await validateInstructorAssignments(normalizedAssignments);
+
+    if (assignmentError) {
+      return res.status(400).json({
+        success: false,
+        error: assignmentError,
+      });
+    }
+
+    const primaryInstructorId = buildPrimaryInstructorId(normalizedAssignments, req.user.id);
+
     const course = await Course.create({
       ...courseData,
       batches,
-      instructorId: req.body.instructorId || req.user.id,
+      instructorId: primaryInstructorId,
     });
+
+    await syncCourseInstructors(course._id, normalizedAssignments);
 
     await course.populate('batches', 'name isActive');
     await course.populate('instructorId', 'name email');
 
+    const assignmentsMap = await getCourseAssignmentsMap([course._id]);
+    const responseCourse = {
+      ...course.toObject(),
+      courseInstructors: assignmentsMap.get(course._id.toString()) || [],
+    };
+
     res.status(201).json({
       success: true,
-      data: course,
+      data: responseCourse,
     });
   } catch (error) {
     next(error);
@@ -226,11 +271,8 @@ exports.createCourse = async (req, res, next) => {
 // @access  Private/Admin
 exports.updateCourse = async (req, res, next) => {
   try {
-    const course = await Course.findByIdAndUpdate(
-      req.params.id,
-      req.body,
-      { new: true, runValidators: true }
-    );
+    const { courseInstructors, instructorId, ...updateData } = req.body;
+    const course = await Course.findById(req.params.id);
 
     if (!course) {
       return res.status(404).json({
@@ -239,9 +281,42 @@ exports.updateCourse = async (req, res, next) => {
       });
     }
 
+    const normalizedAssignments = courseInstructors !== undefined || instructorId
+      ? normalizeAssignments(courseInstructors, instructorId || course.instructorId)
+      : null;
+
+    if (normalizedAssignments) {
+      const assignmentError = await validateInstructorAssignments(normalizedAssignments);
+
+      if (assignmentError) {
+        return res.status(400).json({
+          success: false,
+          error: assignmentError,
+        });
+      }
+
+      updateData.instructorId = buildPrimaryInstructorId(normalizedAssignments, course.instructorId);
+    }
+
+    Object.assign(course, updateData);
+    await course.save();
+
+    if (normalizedAssignments) {
+      await syncCourseInstructors(course._id, normalizedAssignments);
+    }
+
+    await course.populate('instructorId', 'name email');
+    await course.populate('batches', 'name isActive');
+
+    const assignmentsMap = await getCourseAssignmentsMap([course._id]);
+    const responseCourse = {
+      ...course.toObject(),
+      courseInstructors: assignmentsMap.get(course._id.toString()) || [],
+    };
+
     res.status(200).json({
       success: true,
-      data: course,
+      data: responseCourse,
     });
   } catch (error) {
     next(error);
@@ -263,6 +338,7 @@ exports.deleteCourse = async (req, res, next) => {
     }
 
     await course.deleteOne();
+    await CourseInstructor.deleteMany({ course_id: course._id });
 
     // Delete related data
     await Progress.deleteMany({ courseId: course._id });
@@ -289,10 +365,30 @@ exports.getCourses = async (req, res, next) => {
       .populate('batches', 'name isActive')
       .sort({ createdAt: -1 });
 
+    const assignmentsMap = await getCourseAssignmentsMap(courses.map((course) => course._id));
+
+    const responseCourses = courses.map((course) => {
+      const courseObj = course.toObject();
+      const assignments = assignmentsMap.get(course._id.toString()) || [];
+
+      if (!assignments.length && course.instructorId) {
+        assignments.push({
+          instructorId: course.instructorId,
+          role: 'editor',
+          createdAt: course.createdAt,
+        });
+      }
+
+      return {
+        ...courseObj,
+        courseInstructors: assignments,
+      };
+    });
+
     res.status(200).json({
       success: true,
-      data: courses,
-      count: courses.length,
+      data: responseCourses,
+      count: responseCourses.length,
     });
   } catch (error) {
     next(error);

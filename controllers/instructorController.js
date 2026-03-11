@@ -3,6 +3,55 @@ const Progress = require('../models/Progress');
 const Assessment = require('../models/Assessment');
 const Submission = require('../models/Submission');
 const User = require('../models/User');
+const CourseInstructor = require('../models/CourseInstructor');
+const {
+  getCourseRoleForUser,
+  getCourseAssignmentsMap,
+  normalizeAssignments,
+  syncCourseInstructors,
+} = require('../utils/courseInstructorService');
+
+const getAssignedCourseIds = async (userId) => {
+  const assignments = await CourseInstructor.find({ instructor_id: userId }).select('course_id');
+  return assignments.map((item) => item.course_id);
+};
+
+const getCourseAccessRole = async (course, req) => {
+  return getCourseRoleForUser({
+    courseId: course._id,
+    userId: req.user.id,
+    fallbackInstructorId: course.instructorId,
+    userRole: req.user.role,
+  });
+};
+
+const ensureCourseAccess = async ({ course, req, requireEditor = false, errorMessage = 'Not authorized' }) => {
+  const role = await getCourseAccessRole(course, req);
+
+  if (!role) {
+    return {
+      ok: false,
+      status: 403,
+      payload: {
+        success: false,
+        error: errorMessage,
+      },
+    };
+  }
+
+  if (requireEditor && role !== 'editor') {
+    return {
+      ok: false,
+      status: 403,
+      payload: {
+        success: false,
+        error: 'Only editor instructors can modify this course',
+      },
+    };
+  }
+
+  return { ok: true, role };
+};
 
 // @desc    Get instructor dashboard
 // @route   GET /api/instructors/dashboard
@@ -10,8 +59,14 @@ const User = require('../models/User');
 exports.getDashboard = async (req, res, next) => {
   try {
     const instructorId = req.user.id;
+    const assignedCourseIds = await getAssignedCourseIds(instructorId);
 
-    const courses = await Course.find({ instructorId });
+    const courses = await Course.find({
+      $or: [
+        { _id: { $in: assignedCourseIds } },
+        { instructorId },
+      ],
+    });
     const totalCourses = courses.length;
     const publishedCourses = courses.filter(c => c.visibility === 'published').length;
 
@@ -45,14 +100,35 @@ exports.getDashboard = async (req, res, next) => {
 // @access  Private/Instructor
 exports.getCourses = async (req, res, next) => {
   try {
-    const courses = await Course.find({ instructorId: req.user.id })
+    const assignedCourseIds = await getAssignedCourseIds(req.user.id);
+
+    const courses = await Course.find({
+      $or: [
+        { _id: { $in: assignedCourseIds } },
+        { instructorId: req.user.id },
+      ],
+    })
       .populate('batches', 'name isActive')
       .sort({ createdAt: -1 });
 
+    const assignmentsMap = await getCourseAssignmentsMap(courses.map((course) => course._id));
+
+    const responseCourses = courses.map((course) => {
+      const courseObj = course.toObject();
+      const assignments = assignmentsMap.get(course._id.toString()) || [];
+      const me = assignments.find((item) => item.instructorId?._id?.toString() === req.user.id);
+
+      return {
+        ...courseObj,
+        instructorRole: me?.role || (course.instructorId?.toString() === req.user.id ? 'editor' : 'viewer'),
+        courseInstructors: assignments,
+      };
+    });
+
     res.status(200).json({
       success: true,
-      data: courses,
-      count: courses.length,
+      data: responseCourses,
+      count: responseCourses.length,
     });
   } catch (error) {
     next(error);
@@ -64,7 +140,7 @@ exports.getCourses = async (req, res, next) => {
 // @access  Private/Instructor
 exports.createCourse = async (req, res, next) => {
   try {
-    const { batches, ...courseData } = req.body;
+    const { batches, courseInstructors, ...courseData } = req.body;
 
     // Validate batches
     if (!batches || !Array.isArray(batches) || batches.length === 0) {
@@ -91,6 +167,9 @@ exports.createCourse = async (req, res, next) => {
       instructorId: req.user.id,
     });
 
+    const normalizedAssignments = normalizeAssignments(courseInstructors, req.user.id);
+    await syncCourseInstructors(course._id, normalizedAssignments);
+
     await course.populate('batches', 'name isActive');
 
     res.status(201).json({
@@ -116,12 +195,14 @@ exports.updateCourse = async (req, res, next) => {
       });
     }
 
-    // Check ownership
-    if (course.instructorId.toString() !== req.user.id) {
-      return res.status(403).json({
-        success: false,
-        error: 'Not authorized to update this course',
-      });
+    const access = await ensureCourseAccess({
+      course,
+      req,
+      requireEditor: true,
+      errorMessage: 'Not authorized to update this course',
+    });
+    if (!access.ok) {
+      return res.status(access.status).json(access.payload);
     }
 
     Object.assign(course, req.body);
@@ -150,11 +231,9 @@ exports.addModule = async (req, res, next) => {
       });
     }
 
-    if (course.instructorId.toString() !== req.user.id) {
-      return res.status(403).json({
-        success: false,
-        error: 'Not authorized',
-      });
+    const access = await ensureCourseAccess({ course, req, requireEditor: true });
+    if (!access.ok) {
+      return res.status(access.status).json(access.payload);
     }
 
     const maxOrder = course.modules.length > 0
@@ -192,11 +271,9 @@ exports.updateModule = async (req, res, next) => {
       });
     }
 
-    if (course.instructorId.toString() !== req.user.id) {
-      return res.status(403).json({
-        success: false,
-        error: 'Not authorized',
-      });
+    const access = await ensureCourseAccess({ course, req, requireEditor: true });
+    if (!access.ok) {
+      return res.status(access.status).json(access.payload);
     }
 
     const module = course.modules.id(req.params.moduleId);
@@ -233,11 +310,9 @@ exports.deleteModule = async (req, res, next) => {
       });
     }
 
-    if (course.instructorId.toString() !== req.user.id) {
-      return res.status(403).json({
-        success: false,
-        error: 'Not authorized',
-      });
+    const access = await ensureCourseAccess({ course, req, requireEditor: true });
+    if (!access.ok) {
+      return res.status(access.status).json(access.payload);
     }
 
     course.modules.id(req.params.moduleId).deleteOne();
@@ -266,11 +341,9 @@ exports.addLesson = async (req, res, next) => {
       });
     }
 
-    if (course.instructorId.toString() !== req.user.id) {
-      return res.status(403).json({
-        success: false,
-        error: 'Not authorized',
-      });
+    const access = await ensureCourseAccess({ course, req, requireEditor: true });
+    if (!access.ok) {
+      return res.status(access.status).json(access.payload);
     }
 
     const module = course.modules.id(req.params.moduleId);
@@ -315,11 +388,9 @@ exports.updateLesson = async (req, res, next) => {
       });
     }
 
-    if (course.instructorId.toString() !== req.user.id) {
-      return res.status(403).json({
-        success: false,
-        error: 'Not authorized',
-      });
+    const access = await ensureCourseAccess({ course, req, requireEditor: true });
+    if (!access.ok) {
+      return res.status(access.status).json(access.payload);
     }
 
     const module = course.modules.id(req.params.moduleId);
@@ -364,11 +435,9 @@ exports.deleteLesson = async (req, res, next) => {
       });
     }
 
-    if (course.instructorId.toString() !== req.user.id) {
-      return res.status(403).json({
-        success: false,
-        error: 'Not authorized',
-      });
+    const access = await ensureCourseAccess({ course, req, requireEditor: true });
+    if (!access.ok) {
+      return res.status(access.status).json(access.payload);
     }
 
     const module = course.modules.id(req.params.moduleId);
@@ -413,11 +482,14 @@ exports.createAssessment = async (req, res, next) => {
       });
     }
 
-    if (course.instructorId.toString() !== req.user.id) {
-      return res.status(403).json({
-        success: false,
-        error: 'Not authorized to create assessment for this course',
-      });
+    const access = await ensureCourseAccess({
+      course,
+      req,
+      requireEditor: true,
+      errorMessage: 'Not authorized to create assessment for this course',
+    });
+    if (!access.ok) {
+      return res.status(access.status).json(access.payload);
     }
 
     // Add order to questions if not provided
@@ -449,7 +521,13 @@ exports.createAssessment = async (req, res, next) => {
 // @access  Private/Instructor
 exports.getAssessments = async (req, res, next) => {
   try {
-    const courses = await Course.find({ instructorId: req.user.id });
+    const assignedCourseIds = await getAssignedCourseIds(req.user.id);
+    const courses = await Course.find({
+      $or: [
+        { _id: { $in: assignedCourseIds } },
+        { instructorId: req.user.id },
+      ],
+    });
     const courseIds = courses.map(c => c._id);
 
     const assessments = await Assessment.find({ courseId: { $in: courseIds } })
@@ -480,11 +558,9 @@ exports.getCourseProgress = async (req, res, next) => {
       });
     }
 
-    if (course.instructorId.toString() !== req.user.id) {
-      return res.status(403).json({
-        success: false,
-        error: 'Not authorized',
-      });
+    const access = await ensureCourseAccess({ course, req });
+    if (!access.ok) {
+      return res.status(access.status).json(access.payload);
     }
 
     const progressData = await Progress.find({ courseId })
@@ -515,7 +591,15 @@ exports.getSubmissions = async (req, res, next) => {
     }
 
     const course = await Course.findById(assessment.courseId);
-    if (!course || course.instructorId.toString() !== req.user.id) {
+    if (!course) {
+      return res.status(403).json({
+        success: false,
+        error: 'Not authorized',
+      });
+    }
+
+    const access = await ensureCourseAccess({ course, req });
+    if (!access.ok) {
       return res.status(403).json({
         success: false,
         error: 'Not authorized',
@@ -567,10 +651,18 @@ exports.gradeSubmission = async (req, res, next) => {
     const assessment = submission.assessmentId;
     const course = await Course.findById(assessment.courseId);
 
-    if (!course || course.instructorId.toString() !== req.user.id) {
+    if (!course) {
       return res.status(403).json({
         success: false,
         error: 'Not authorized',
+      });
+    }
+
+    const access = await ensureCourseAccess({ course, req, requireEditor: true });
+    if (!access.ok) {
+      return res.status(403).json({
+        success: false,
+        error: access.payload.error,
       });
     }
 
