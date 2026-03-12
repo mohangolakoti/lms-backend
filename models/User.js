@@ -35,6 +35,10 @@ const userSchema = new mongoose.Schema({
     enum: ['active', 'blocked'],
     default: 'active',
   },
+  batchBlocked: {
+    type: Boolean,
+    default: false,
+  },
   batch: {
     type: String,
     enum: ['longTerm', 'shortTerm'],

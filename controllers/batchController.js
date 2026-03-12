@@ -1,4 +1,5 @@
 const Batch = require('../models/Batch');
+const Student = require('../models/User');
 const logger = require('../utils/logger');
 const ResponseHandler = require('../utils/responseHandler');
 const PaginationHelper = require('../utils/paginationHelper');
@@ -128,6 +129,12 @@ exports.updateBatchStatus = async (req, res, next) => {
     // Update batch status (no auto-deactivation of others)
     batch.isActive = isActive;
     await batch.save();
+
+    // Block/unblock students based on batch status
+    await Student.updateMany(
+      { role: 'student', batchId: batch._id },
+      { batchBlocked: !isActive }
+    );
 
     logger.info(`Batch ${id} status updated to ${isActive} by user: ${req.user?._id}`);
 

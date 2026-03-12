@@ -2,6 +2,7 @@ const jwt = require('jsonwebtoken');
 const { jwtSecret } = require('../config/jwt');
 const User = require('../models/User');
 const logger = require('../utils/logger');
+const { ForbiddenError } = require('../utils/errors');
 
 // Protect routes
 exports.protect = async (req, res, next) => {
@@ -37,8 +38,22 @@ exports.protect = async (req, res, next) => {
       });
     }
 
+    // Check if user's batch is inactive
+    if (req.user.batchBlocked === true) {
+      throw new ForbiddenError(
+        'Your batch is currently inactive. Access has been temporarily disabled.'
+      );
+    }
+
     next();
   } catch (error) {
+    if (error instanceof ForbiddenError) {
+      return res.status(403).json({
+        success: false,
+        error: error.message,
+      });
+    }
+
     logger.error('Auth middleware error:', error);
     return res.status(401).json({
       success: false,

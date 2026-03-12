@@ -125,6 +125,14 @@ exports.login = async (req, res, next) => {
       throw new UnauthorizedError('Invalid email or password');
     }
 
+    if (user.batchBlocked) {
+      return ResponseHandler.error(
+        res,
+        new ForbiddenError('Your batch is currently inactive. Please contact the administrator.'),
+        403
+      );
+    }
+
     // Check if user is blocked
     if (user.status === 'blocked') {
       logger.warn(`Login attempt by blocked user: ${user._id}`);

@@ -576,29 +576,32 @@ exports.submitAssessment = async (req, res, next) => {
 exports.getAnnouncements = async (req, res, next) => {
   try {
     const userId = req.user.id;
-    const user = await User.findById(userId);
+    const user = await User.findById(userId).select('batchId');
 
-    // Get assigned courses
-    const courses = await Course.find({
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        error: 'User not found',
+      });
+    }
+
+    const announcementFilter = {
       $or: [
-        { term: user.batch },
-        { term: 'both' },
+        { targetType: 'global' },
       ],
-      visibility: 'published',
-    });
+    };
 
-    const courseIds = courses.map(c => c._id);
+    if (user.batchId) {
+      announcementFilter.$or.push({
+        targetType: 'batch',
+        batchIds: user.batchId,
+      });
+    }
 
-    // Get global and course-specific announcements
-    const announcements = await Announcement.find({
-      $or: [
-        { target: 'global' },
-        { target: 'course', courseId: { $in: courseIds } },
-      ],
-    })
+    const announcements = await Announcement.find(announcementFilter)
       .populate('createdBy', 'name')
-      .populate('courseId', 'title')
-      .sort({ pinned: -1, createdAt: -1 });
+      .populate('batchIds', 'name')
+      .sort({ createdAt: -1 });
 
     res.status(200).json({
       success: true,
