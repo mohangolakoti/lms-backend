@@ -15,6 +15,7 @@ const studentRoutes = require('./routes/students');
 const adminRoutes = require('./routes/admin');
 const instructorRoutes = require('./routes/instructors');
 const batchRoutes = require('./routes/batches');
+const certificateRoutes = require('./routes/certificates');
 
 // Connect to database
 connectDB();
@@ -81,6 +82,7 @@ app.use('/api/students', studentRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/instructors', instructorRoutes);
 app.use('/api/admin/batches', batchRoutes);
+app.use('/api/certificates', certificateRoutes);
 
 /**
  * @swagger
