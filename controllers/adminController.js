@@ -528,7 +528,7 @@ exports.createAnnouncement = async (req, res, next) => {
         role: 'student',
         status: 'active',
         approvalStatus: 'approved',
-      }).select('_id email name phoneNumber batchId');
+      }).select('_id email name mobile batchId');
     } else if (targetType === 'batch') {
       // Get students in specified batches
       targetStudents = await User.find({
@@ -536,7 +536,7 @@ exports.createAnnouncement = async (req, res, next) => {
         status: 'active',
         approvalStatus: 'approved',
         batchId: { $in: batchIds },
-      }).select('_id email name phoneNumber batchId');
+      }).select('_id email name mobile batchId');
     }
 
     logger.info(`Announcement targeting ${targetStudents.length} students`);
@@ -671,8 +671,8 @@ async function handleWhatsAppDelivery(announcement, targetStudents) {
     return { channel: 'whatsapp', sent: 0, failed: 0 };
   }
 
-  // Filter students with phone numbers
-  const studentsWithPhone = targetStudents.filter(s => s.phoneNumber);
+  // Filter students with mobile numbers
+  const studentsWithPhone = targetStudents.filter(s => s.mobile);
 
   if (studentsWithPhone.length === 0) {
     logger.info('WhatsApp: No students with phone numbers');
@@ -680,7 +680,7 @@ async function handleWhatsAppDelivery(announcement, targetStudents) {
   }
 
   const messages = studentsWithPhone.map(student => ({
-    phoneNumber: student.phoneNumber,
+    phoneNumber: student.mobile,
     title: announcement.title,
     message: announcement.message,
   }));

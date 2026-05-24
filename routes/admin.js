@@ -78,23 +78,17 @@ router.get('/students', getStudents);
 
 /**
  * @swagger
- * /api/admin/students/{id}:
+ * /api/admin/students/approval/pending:
  *   get:
- *     summary: Get student by ID
+ *     summary: Get pending student approvals
  *     tags: [Admin]
  *     security:
  *       - bearerAuth: []
- *     parameters:
- *       - in: path
- *         name: id
- *         required: true
- *         schema:
- *           type: string
  *     responses:
  *       200:
- *         description: Student details with progress
+ *         description: List of pending students
  */
-router.get('/students/:id', getStudent);
+router.get('/students/approval/pending', getPendingStudents);
 
 /**
  * @swagger
@@ -132,17 +126,23 @@ router.put('/students/:id/status', [
 
 /**
  * @swagger
- * /api/admin/students/approval/pending:
+ * /api/admin/students/{id}:
  *   get:
- *     summary: Get pending student approvals
+ *     summary: Get student by ID
  *     tags: [Admin]
  *     security:
  *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
  *     responses:
  *       200:
- *         description: List of pending students
+ *         description: Student details with progress
  */
-router.get('/students/approval/pending', getPendingStudents);
+router.get('/students/:id', getStudent);
 
 /**
  * @swagger

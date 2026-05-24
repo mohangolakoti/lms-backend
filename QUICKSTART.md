@@ -24,9 +24,9 @@
    cp .env.example .env
    ```
    Edit `.env` and set:
-   - `MONGODB_URI` 
-     - **For MongoDB Atlas**: `mongodb+srv://lms:lms@123@cluster0.vmrjoej.mongodb.net/?appName=Cluster0`
-     - **For local MongoDB**: `mongodb+srv://lms:lms@123@cluster0.vmrjoej.mongodb.net/?appName=Cluster0`
+  - `MONGODB_URI`
+    - **For MongoDB Atlas**: `mongodb+srv://<username>:<password>@<cluster-url>/<database>?retryWrites=true&w=majority`
+    - **For local MongoDB**: `mongodb://localhost:27017/institutional-lms`
    - `JWT_SECRET` (use a strong secret)
    - `JWT_REFRESH_SECRET` (use a strong secret)
 

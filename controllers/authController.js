@@ -29,10 +29,10 @@ exports.register = async (req, res, next) => {
       throw new ConflictError('User with this email already exists');
     }
 
-    // Prevent instructor self-registration - only admin and students can register
+    // Public registration is only available for students.
     const requestedRole = role || 'student';
-    if (requestedRole === 'instructor') {
-      throw new ForbiddenError('Instructors cannot self-register. Only admins can create instructor accounts.');
+    if (requestedRole !== 'student') {
+      throw new ForbiddenError('Public registration is only available for students.');
     }
 
     // Prepare user data
@@ -258,7 +258,6 @@ exports.forgotPassword = async (req, res, next) => {
 
       res.status(200).json({
         success: true,
-        data: { resetToken },
         message: 'Email sent',
       });
     } catch (err) {
