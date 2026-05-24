@@ -67,14 +67,6 @@ backend/
    ```
    
    Edit `.env` and set your configuration:
-   ```env
-   NODE_ENV=development
-   PORT=3000
-   MONGODB_URI=mongodb+srv://lms:lms@123@cluster0.vmrjoej.mongodb.net/?appName=Cluster0
-   JWT_SECRET=your-super-secret-jwt-key
-   JWT_REFRESH_SECRET=your-super-secret-refresh-key
-   FRONTEND_URL=http://localhost:3001
-   ```
 
 4. **Seed the database** (optional)
    ```bash

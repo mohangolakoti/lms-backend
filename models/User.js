@@ -100,7 +100,6 @@ const userSchema = new mongoose.Schema({
 
 // Create compound indexes
 userSchema.index({ role: 1, status: 1 });
-userSchema.index({ email: 1 });
 userSchema.index({ batchId: 1, approvalStatus: 1 });
 userSchema.index({ createdAt: -1 });
 

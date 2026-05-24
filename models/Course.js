@@ -97,8 +97,6 @@ const courseSchema = new mongoose.Schema({
 
 // Indexes for efficient queries
 courseSchema.index({ term: 1, visibility: 1 });
-courseSchema.index({ instructorId: 1 });
-courseSchema.index({ batches: 1 });
 courseSchema.index({ term: 1, batches: 1, visibility: 1 });
 courseSchema.index({ createdAt: -1 });
 courseSchema.index({ title: 'text', description: 'text' });
