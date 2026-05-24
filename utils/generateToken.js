@@ -9,8 +9,8 @@ const generateToken = (id) => {
 };
 
 // Generate Refresh Token
-const generateRefreshToken = (id) => {
-  return jwt.sign({ id }, jwtRefreshSecret, {
+const generateRefreshToken = (id, tokenVersion = 0, sessionId = null) => {
+  return jwt.sign({ id, tokenVersion, sessionId }, jwtRefreshSecret, {
     expiresIn: jwtRefreshExpire,
   });
 };

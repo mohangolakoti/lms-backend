@@ -3,7 +3,10 @@ const router = express.Router();
 const {
   register,
   login,
+  refresh,
   logout,
+  getSessions,
+  revokeSession,
   getMe,
   forgotPassword,
   resetPassword,
@@ -55,7 +58,7 @@ const loginValidation = [
  *                 type: string
  *               role:
  *                 type: string
- *                 enum: [admin, instructor, student]
+ *                 enum: [student]
  *               batch:
  *                 type: string
  *                 enum: [longTerm, shortTerm]
@@ -98,6 +101,33 @@ router.post('/login', authLimiter, loginValidation, validate, login);
 
 /**
  * @swagger
+ * /api/auth/refresh:
+ *   post:
+ *     summary: Refresh access token using refresh token
+ *     tags: [Authentication]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - refreshToken
+ *             properties:
+ *               refreshToken:
+ *                 type: string
+ *     responses:
+ *       200:
+ *         description: Token refreshed successfully
+ *       401:
+ *         description: Invalid or expired refresh token
+ */
+router.post('/refresh', authLimiter, [
+  body('refreshToken').notEmpty().withMessage('Refresh token is required'),
+], validate, refresh);
+
+/**
+ * @swagger
  * /api/auth/logout:
  *   post:
  *     summary: Logout user
@@ -109,6 +139,42 @@ router.post('/login', authLimiter, loginValidation, validate, login);
  *         description: Logout successful
  */
 router.post('/logout', protect, logout);
+
+/**
+ * @swagger
+ * /api/auth/sessions:
+ *   get:
+ *     summary: Get active sessions for current user
+ *     tags: [Authentication]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: Active sessions retrieved
+ */
+router.get('/sessions', protect, getSessions);
+
+/**
+ * @swagger
+ * /api/auth/sessions/{sessionId}:
+ *   delete:
+ *     summary: Revoke a specific session for current user
+ *     tags: [Authentication]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: sessionId
+ *         required: true
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: Session revoked
+ *       404:
+ *         description: Session not found
+ */
+router.delete('/sessions/:sessionId', protect, revokeSession);
 
 /**
  * @swagger

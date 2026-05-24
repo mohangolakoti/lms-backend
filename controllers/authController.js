@@ -1,7 +1,11 @@
 const crypto = require('crypto');
+const jwt = require('jsonwebtoken');
+const { v4: uuidv4 } = require('uuid');
 const User = require('../models/User');
 const Batch = require('../models/Batch');
+const RefreshSession = require('../models/RefreshSession');
 const { generateToken, generateRefreshToken } = require('../utils/generateToken');
+const { jwtRefreshSecret } = require('../config/jwt');
 const sendEmail = require('../utils/sendEmail');
 const logger = require('../utils/logger');
 const ResponseHandler = require('../utils/responseHandler');
@@ -84,8 +88,19 @@ exports.register = async (req, res, next) => {
     }
 
     // For admin/instructor, return token immediately
+    const sessionId = uuidv4();
     const token = generateToken(user._id);
-    const refreshToken = generateRefreshToken(user._id);
+    const refreshToken = generateRefreshToken(user._id, user.tokenVersion, sessionId);
+    const decodedRefresh = jwt.decode(refreshToken);
+
+    await RefreshSession.create({
+      userId: user._id,
+      sessionId,
+      userAgent: req.headers['user-agent'] || '',
+      ipAddress: req.ip || req.connection?.remoteAddress || '',
+      lastUsedAt: new Date(),
+      expiresAt: new Date(decodedRefresh.exp * 1000),
+    });
 
     return ResponseHandler.created(res, {
       token,
@@ -165,8 +180,19 @@ exports.login = async (req, res, next) => {
 
     logger.info(`User logged in: ${user._id}`);
 
+    const sessionId = uuidv4();
     const token = generateToken(user._id);
-    const refreshToken = generateRefreshToken(user._id);
+    const refreshToken = generateRefreshToken(user._id, user.tokenVersion, sessionId);
+    const decodedRefresh = jwt.decode(refreshToken);
+
+    await RefreshSession.create({
+      userId: user._id,
+      sessionId,
+      userAgent: req.headers['user-agent'] || '',
+      ipAddress: req.ip || req.connection?.remoteAddress || '',
+      lastUsedAt: new Date(),
+      expiresAt: new Date(decodedRefresh.exp * 1000),
+    });
 
     return ResponseHandler.success(res, {
       token,
@@ -187,15 +213,105 @@ exports.login = async (req, res, next) => {
   }
 };
 
+// @desc    Refresh access token
+// @route   POST /api/auth/refresh
+// @access  Public
+exports.refresh = async (req, res, next) => {
+  try {
+    const { refreshToken } = req.body;
+
+    if (!refreshToken) {
+      throw new UnauthorizedError('Refresh token is required');
+    }
+
+    const decoded = jwt.verify(refreshToken, jwtRefreshSecret);
+    const user = await User.findById(decoded.id).select('-password');
+
+    if (!user) {
+      throw new UnauthorizedError('Invalid refresh token');
+    }
+
+    if ((decoded.tokenVersion ?? 0) !== (user.tokenVersion ?? 0)) {
+      throw new UnauthorizedError('Refresh token has been revoked');
+    }
+
+    if (!decoded.sessionId) {
+      throw new UnauthorizedError('Invalid refresh token session');
+    }
+
+    const activeSession = await RefreshSession.findOne({
+      userId: user._id,
+      sessionId: decoded.sessionId,
+      isRevoked: false,
+      expiresAt: { $gt: new Date() },
+    });
+
+    if (!activeSession) {
+      throw new UnauthorizedError('Session not found or revoked');
+    }
+
+    if (user.status === 'blocked') {
+      throw new ForbiddenError('Your account has been blocked. Please contact administrator.');
+    }
+
+    if (user.batchBlocked) {
+      throw new ForbiddenError('Your batch is currently inactive. Please contact the administrator.');
+    }
+
+    if (user.role === 'student') {
+      if (user.approvalStatus === 'rejected') {
+        throw new ForbiddenError('Your account has been rejected. Please contact administrator.');
+      }
+      if (user.approvalStatus !== 'approved') {
+        throw new ForbiddenError('Account pending admin approval');
+      }
+    }
+
+    const newAccessToken = generateToken(user._id);
+    const newRefreshToken = generateRefreshToken(user._id, user.tokenVersion, decoded.sessionId);
+    const newDecodedRefresh = jwt.decode(newRefreshToken);
+
+    activeSession.lastUsedAt = new Date();
+    activeSession.expiresAt = new Date(newDecodedRefresh.exp * 1000);
+    await activeSession.save();
+
+    return ResponseHandler.success(res, {
+      token: newAccessToken,
+      refreshToken: newRefreshToken,
+      user: {
+        id: user._id,
+        name: user.name,
+        email: user.email,
+        role: user.role,
+        batch: user.batch,
+        batchId: user.batchId,
+        avatarUrl: user.avatarUrl,
+        approvalStatus: user.approvalStatus,
+      },
+    }, 'Token refreshed');
+  } catch (error) {
+    if (error.name === 'JsonWebTokenError' || error.name === 'TokenExpiredError') {
+      return ResponseHandler.error(res, new UnauthorizedError('Invalid or expired refresh token'), 401);
+    }
+    return next(error);
+  }
+};
+
 // @desc    Logout user / clear cookie
 // @route   POST /api/auth/logout
 // @access  Private
 exports.logout = async (req, res, next) => {
   try {
+    await User.findByIdAndUpdate(req.user.id, { $inc: { tokenVersion: 1 } });
+    await RefreshSession.updateMany(
+      { userId: req.user.id, isRevoked: false },
+      { $set: { isRevoked: true, revokedAt: new Date() } }
+    );
+
     res.status(200).json({
       success: true,
       data: {},
-      message: 'Logged out successfully',
+      message: 'Logged out successfully. Session tokens revoked.',
     });
   } catch (error) {
     next(error);
@@ -215,6 +331,52 @@ exports.getMe = async (req, res, next) => {
     });
   } catch (error) {
     next(error);
+  }
+};
+
+// @desc    Get active sessions for current user
+// @route   GET /api/auth/sessions
+// @access  Private
+exports.getSessions = async (req, res, next) => {
+  try {
+    const sessions = await RefreshSession.find({
+      userId: req.user.id,
+      isRevoked: false,
+      expiresAt: { $gt: new Date() },
+    })
+      .sort({ lastUsedAt: -1 })
+      .select('sessionId userAgent ipAddress lastUsedAt expiresAt createdAt');
+
+    return ResponseHandler.success(res, sessions, 'Active sessions retrieved');
+  } catch (error) {
+    return next(error);
+  }
+};
+
+// @desc    Revoke a single session for current user
+// @route   DELETE /api/auth/sessions/:sessionId
+// @access  Private
+exports.revokeSession = async (req, res, next) => {
+  try {
+    const { sessionId } = req.params;
+
+    const session = await RefreshSession.findOne({
+      userId: req.user.id,
+      sessionId,
+      isRevoked: false,
+    });
+
+    if (!session) {
+      throw new NotFoundError('Session');
+    }
+
+    session.isRevoked = true;
+    session.revokedAt = new Date();
+    await session.save();
+
+    return ResponseHandler.success(res, {}, 'Session revoked');
+  } catch (error) {
+    return next(error);
   }
 };
 
@@ -301,16 +463,33 @@ exports.resetPassword = async (req, res, next) => {
 
     // Set new password
     user.password = req.body.password;
+    user.tokenVersion = (user.tokenVersion || 0) + 1;
     user.passwordResetToken = undefined;
     user.passwordResetExpires = undefined;
     await user.save();
+    await RefreshSession.updateMany(
+      { userId: user._id, isRevoked: false },
+      { $set: { isRevoked: true, revokedAt: new Date() } }
+    );
 
     const token = generateToken(user._id);
+    const sessionId = uuidv4();
+    const refreshToken = generateRefreshToken(user._id, user.tokenVersion, sessionId);
+    const decodedRefresh = jwt.decode(refreshToken);
+    await RefreshSession.create({
+      userId: user._id,
+      sessionId,
+      userAgent: req.headers['user-agent'] || '',
+      ipAddress: req.ip || req.connection?.remoteAddress || '',
+      lastUsedAt: new Date(),
+      expiresAt: new Date(decodedRefresh.exp * 1000),
+    });
 
     res.status(200).json({
       success: true,
       data: {
         token,
+        refreshToken,
         user: {
           id: user._id,
           name: user.name,
@@ -340,14 +519,31 @@ exports.updatePassword = async (req, res, next) => {
     }
 
     user.password = req.body.newPassword;
+    user.tokenVersion = (user.tokenVersion || 0) + 1;
     await user.save();
+    await RefreshSession.updateMany(
+      { userId: user._id, isRevoked: false },
+      { $set: { isRevoked: true, revokedAt: new Date() } }
+    );
 
     const token = generateToken(user._id);
+    const sessionId = uuidv4();
+    const refreshToken = generateRefreshToken(user._id, user.tokenVersion, sessionId);
+    const decodedRefresh = jwt.decode(refreshToken);
+    await RefreshSession.create({
+      userId: user._id,
+      sessionId,
+      userAgent: req.headers['user-agent'] || '',
+      ipAddress: req.ip || req.connection?.remoteAddress || '',
+      lastUsedAt: new Date(),
+      expiresAt: new Date(decodedRefresh.exp * 1000),
+    });
 
     res.status(200).json({
       success: true,
       data: {
         token,
+        refreshToken,
         user: {
           id: user._id,
           name: user.name,
