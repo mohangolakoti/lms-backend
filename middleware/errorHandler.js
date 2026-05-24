@@ -9,6 +9,7 @@ const errorHandler = (err, req, res, next) => {
   let message = 'Internal server error';
 
   logger.error(`[Error] ${err.message}`, {
+    requestId: req.requestId,
     code: err.code,
     name: err.name,
     statusCode: err.statusCode,

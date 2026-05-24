@@ -3,8 +3,10 @@ const cors = require('cors');
 const helmet = require('helmet');
 const errorHandler = require('./middleware/errorHandler');
 const { apiLimiter } = require('./middleware/rateLimiter');
+const requestContext = require('./middleware/requestContext');
 const swaggerUi = require('swagger-ui-express');
 const swaggerJsdoc = require('swagger-jsdoc');
+const { getDatabaseHealth } = require('./config/database');
 
 const authRoutes = require('./routes/auth');
 const studentRoutes = require('./routes/students');
@@ -15,27 +17,58 @@ const certificateRoutes = require('./routes/certificates');
 
 const app = express();
 
-const allowedOrigins = [
+const normalizeOrigin = (origin) => String(origin || '').trim().replace(/\/$/, '').toLowerCase();
+
+const parseConfiguredOrigins = () => {
+  const single = process.env.FRONTEND_URL ? [process.env.FRONTEND_URL] : [];
+  const multiple = (process.env.FRONTEND_URLS || '')
+    .split(',')
+    .map((origin) => origin.trim())
+    .filter(Boolean);
+
+  return [...single, ...multiple]
+    .map(normalizeOrigin)
+    .filter(Boolean);
+};
+
+const configuredOrigins = new Set([
+  'http://localhost:3000',
   'http://localhost:3001',
+  'http://localhost:5173',
+  'http://127.0.0.1:3000',
   'http://127.0.0.1:3001',
+  'http://127.0.0.1:5173',
   'https://silicon-lms.vercel.app',
-  ...(process.env.FRONTEND_URL ? [process.env.FRONTEND_URL.replace(/\/$/, '')] : []),
-].map((origin) => origin.replace(/\/$/, ''));
+  ...parseConfiguredOrigins(),
+]);
+
+const isLocalOrigin = (origin) => /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(origin);
+const isVercelPreviewOrigin = (origin) => /^https:\/\/[a-z0-9-]+\.vercel\.app$/i.test(origin);
 
 app.use(helmet());
 app.use(cors({
   origin: (origin, callback) => {
-    if (!origin || allowedOrigins.includes(origin.replace(/\/$/, ''))) {
+    // Allow non-browser clients and same-origin requests with no Origin header.
+    if (!origin) {
       return callback(null, true);
     }
-    return callback(new Error(`CORS blocked for origin: ${origin}`));
+
+    const normalized = normalizeOrigin(origin);
+    const isAllowed = configuredOrigins.has(normalized)
+      || isLocalOrigin(normalized)
+      || isVercelPreviewOrigin(normalized);
+
+    return callback(null, isAllowed);
   },
   credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Request-Id'],
   optionsSuccessStatus: 200,
 }));
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+app.use(requestContext);
 
 const swaggerOptions = {
   definition: {
@@ -78,9 +111,14 @@ app.use('/api/admin/batches', batchRoutes);
 app.use('/api/certificates', certificateRoutes);
 
 app.get('/health', (req, res) => {
-  res.status(200).json({
-    success: true,
-    message: 'Server is running',
+  const database = getDatabaseHealth();
+  const healthy = database.state === 'connected';
+
+  res.status(healthy ? 200 : 503).json({
+    success: healthy,
+    message: healthy ? 'Server is running' : 'Server is degraded',
+    requestId: req.requestId,
+    database,
     timestamp: new Date().toISOString(),
   });
 });

@@ -45,6 +45,22 @@ const announcementSchema = new mongoose.Schema({
     ref: 'User',
     required: true,
   },
+  deliveryStats: {
+    portal: {
+      sent: { type: Number, default: 0 },
+      failed: { type: Number, default: 0 },
+    },
+    email: {
+      sent: { type: Number, default: 0 },
+      failed: { type: Number, default: 0 },
+    },
+    whatsapp: {
+      sent: { type: Number, default: 0 },
+      failed: { type: Number, default: 0 },
+    },
+    totalTargets: { type: Number, default: 0 },
+    updatedAt: { type: Date, default: null },
+  },
 }, {
   timestamps: true,
 });

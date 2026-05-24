@@ -5,6 +5,7 @@ const Assessment = require('../models/Assessment');
 const Submission = require('../models/Submission');
 const Announcement = require('../models/Announcement');
 const Notification = require('../models/Notification');
+const NotificationPreference = require('../models/NotificationPreference');
 const Batch = require('../models/Batch');
 const CourseInstructor = require('../models/CourseInstructor');
 const sendEmail = require('../utils/sendEmail');
@@ -18,6 +19,9 @@ const {
 } = require('../utils/courseInstructorService');
 const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
+
+const DASHBOARD_CACHE_TTL_MS = 60 * 1000;
+let dashboardCache = { data: null, expiresAt: 0 };
 
 const validateInstructorAssignments = async (assignments = []) => {
   if (!assignments.length) {
@@ -42,6 +46,14 @@ const validateInstructorAssignments = async (assignments = []) => {
 // @access  Private/Admin
 exports.getDashboard = async (req, res, next) => {
   try {
+    if (dashboardCache.data && dashboardCache.expiresAt > Date.now()) {
+      return res.status(200).json({
+        success: true,
+        data: dashboardCache.data,
+        cache: { hit: true, expiresAt: new Date(dashboardCache.expiresAt).toISOString() },
+      });
+    }
+
     const totalStudents = await User.countDocuments({ role: 'student' });
     const activeStudents = await User.countDocuments({ role: 'student', status: 'active' });
     const blockedStudents = await User.countDocuments({ role: 'student', status: 'blocked' });
@@ -73,29 +85,87 @@ exports.getDashboard = async (req, res, next) => {
     ]);
     const totalTimeSpent = timeSpentData[0]?.totalTimeSpent || 0;
 
+    const payload = {
+      users: {
+        totalStudents,
+        activeStudents,
+        blockedStudents,
+        totalInstructors,
+      },
+      courses: {
+        totalCourses,
+        publishedCourses,
+        draftCourses,
+      },
+      progress: {
+        totalProgress,
+        completedProgress,
+        completionRate: totalProgress > 0 ? (completedProgress / totalProgress) * 100 : 0,
+      },
+      activity: {
+        activeStudentsRecent,
+        totalTimeSpent: Math.round(totalTimeSpent / 3600), // Convert to hours
+      },
+    };
+
+    dashboardCache = {
+      data: payload,
+      expiresAt: Date.now() + DASHBOARD_CACHE_TTL_MS,
+    };
+
     res.status(200).json({
       success: true,
+      data: payload,
+      cache: { hit: false, expiresAt: new Date(dashboardCache.expiresAt).toISOString() },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Get admin operational reports
+// @route   GET /api/admin/reports/operational
+// @access  Private/Admin
+exports.getOperationalReports = async (req, res, next) => {
+  try {
+    const pendingApprovals = await User.countDocuments({ role: 'student', approvalStatus: 'pending' });
+    const completedProgress = await Progress.countDocuments({ completed: true });
+    const totalProgress = await Progress.countDocuments();
+    const completionRate = totalProgress > 0 ? (completedProgress / totalProgress) * 100 : 0;
+    const batchHealth = await Batch.aggregate([
+      {
+        $lookup: {
+          from: 'users',
+          localField: '_id',
+          foreignField: 'batchId',
+          as: 'students',
+        },
+      },
+      {
+        $project: {
+          name: 1,
+          isActive: 1,
+          studentCount: {
+            $size: {
+              $filter: {
+                input: '$students',
+                as: 'student',
+                cond: { $eq: ['$$student.role', 'student'] },
+              },
+            },
+          },
+        },
+      },
+      { $sort: { createdAt: -1 } },
+      { $limit: 10 },
+    ]);
+
+    return res.status(200).json({
+      success: true,
       data: {
-        users: {
-          totalStudents,
-          activeStudents,
-          blockedStudents,
-          totalInstructors,
-        },
-        courses: {
-          totalCourses,
-          publishedCourses,
-          draftCourses,
-        },
-        progress: {
-          totalProgress,
-          completedProgress,
-          completionRate: totalProgress > 0 ? (completedProgress / totalProgress) * 100 : 0,
-        },
-        activity: {
-          activeStudentsRecent,
-          totalTimeSpent: Math.round(totalTimeSpent / 3600), // Convert to hours
-        },
+        pendingApprovals,
+        completionRate,
+        batchHealth,
       },
     });
   } catch (error) {
@@ -517,6 +587,9 @@ exports.createAnnouncement = async (req, res, next) => {
       batchIds: targetType === 'batch' ? batchIds : [],
       deliveryChannels,
       createdBy: req.user.id,
+      deliveryStats: {
+        totalTargets: 0,
+      },
     });
 
     // Determine target students based on targetType
@@ -540,6 +613,12 @@ exports.createAnnouncement = async (req, res, next) => {
     }
 
     logger.info(`Announcement targeting ${targetStudents.length} students`);
+
+    await Announcement.findByIdAndUpdate(announcement._id, {
+      $set: {
+        'deliveryStats.totalTargets': targetStudents.length,
+      },
+    });
 
     // Process delivery channels asynchronously (non-blocking)
     // Do NOT await these - return success immediately after DB save
@@ -590,14 +669,32 @@ async function handleAnnouncementDelivery(announcement, targetStudents, delivery
 
   // Execute all channels in parallel for scalability
   const results = await Promise.allSettled(deliveryPromises);
+  const deliveryStats = {
+    portal: { sent: 0, failed: 0 },
+    email: { sent: 0, failed: 0 },
+    whatsapp: { sent: 0, failed: 0 },
+    totalTargets: targetStudents.length,
+    updatedAt: new Date(),
+  };
 
   results.forEach((result, index) => {
     const channel = deliveryChannels[index];
     if (result.status === 'rejected') {
       logger.error(`Failed to deliver via ${channel}:`, result.reason);
+      deliveryStats[channel] = { sent: 0, failed: targetStudents.length };
     } else {
       logger.info(`Successfully handled ${channel} delivery:`, result.value);
+      deliveryStats[channel] = {
+        sent: result.value.sent || 0,
+        failed: result.value.failed || 0,
+      };
     }
+  });
+
+  await Announcement.findByIdAndUpdate(announcement._id, {
+    $set: {
+      deliveryStats,
+    },
   });
 }
 
@@ -610,7 +707,17 @@ async function handlePortalDelivery(announcement, targetStudents) {
     return { channel: 'portal', sent: 0 };
   }
 
-  const notifications = targetStudents.map(student => ({
+  const preferences = await NotificationPreference.find({
+    userId: { $in: targetStudents.map((student) => student._id) },
+    'channels.portal': false,
+  }).select('userId').lean();
+  const optOutIds = new Set(preferences.map((item) => item.userId.toString()));
+  const eligibleStudents = targetStudents.filter((student) => !optOutIds.has(student._id.toString()));
+  if (eligibleStudents.length === 0) {
+    return { channel: 'portal', sent: 0, failed: 0 };
+  }
+
+  const notifications = eligibleStudents.map(student => ({
     userId: student._id,
     type: 'announcement',
     title: announcement.title,
@@ -624,7 +731,7 @@ async function handlePortalDelivery(announcement, targetStudents) {
   await Notification.insertMany(notifications);
   logger.info(`Portal: Created ${notifications.length} notifications`);
 
-  return { channel: 'portal', sent: notifications.length };
+  return { channel: 'portal', sent: notifications.length, failed: 0 };
 }
 
 /**
@@ -636,7 +743,17 @@ async function handleEmailDelivery(announcement, targetStudents) {
     return { channel: 'email', sent: 0, failed: 0 };
   }
 
-  const emailPromises = targetStudents.map(student =>
+  const preferences = await NotificationPreference.find({
+    userId: { $in: targetStudents.map((student) => student._id) },
+    'channels.email': false,
+  }).select('userId').lean();
+  const optOutIds = new Set(preferences.map((item) => item.userId.toString()));
+  const eligibleStudents = targetStudents.filter((student) => !optOutIds.has(student._id.toString()));
+  if (eligibleStudents.length === 0) {
+    return { channel: 'email', sent: 0, failed: 0 };
+  }
+
+  const emailPromises = eligibleStudents.map(student =>
     sendEmail({
       email: student.email,
       subject: `New Announcement: ${announcement.title}`,
@@ -672,7 +789,12 @@ async function handleWhatsAppDelivery(announcement, targetStudents) {
   }
 
   // Filter students with mobile numbers
-  const studentsWithPhone = targetStudents.filter(s => s.mobile);
+  const preferences = await NotificationPreference.find({
+    userId: { $in: targetStudents.map((student) => student._id) },
+    'channels.whatsapp': true,
+  }).select('userId').lean();
+  const optedInIds = new Set(preferences.map((item) => item.userId.toString()));
+  const studentsWithPhone = targetStudents.filter(s => s.mobile && optedInIds.has(s._id.toString()));
 
   if (studentsWithPhone.length === 0) {
     logger.info('WhatsApp: No students with phone numbers');

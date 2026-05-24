@@ -70,8 +70,8 @@ const submissionSchema = new mongoose.Schema({
   timestamps: true,
 });
 
-// Compound index
-submissionSchema.index({ userId: 1, assessmentId: 1 });
+// Compound index (one submission per user per assessment)
+submissionSchema.index({ userId: 1, assessmentId: 1 }, { unique: true });
 submissionSchema.index({ assessmentId: 1 });
 submissionSchema.index({ userId: 1 });
 

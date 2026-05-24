@@ -6,10 +6,14 @@ const {
   getCourseDetails,
   updateLessonProgress,
   getAssessments,
+  getAssessmentById,
   submitAssessment,
   getAnnouncements,
   getNotifications,
   markNotificationRead,
+  markAllNotificationsRead,
+  getNotificationPreferences,
+  updateNotificationPreferences,
 } = require('../controllers/studentController');
 const { protect, authorize } = require('../middleware/auth');
 
@@ -113,6 +117,7 @@ router.put('/courses/:courseId/lessons/:lessonId/progress', updateLessonProgress
  *         description: List of assessments
  */
 router.get('/assessments', getAssessments);
+router.get('/assessments/:assessmentId', getAssessmentById);
 
 /**
  * @swagger
@@ -182,6 +187,9 @@ router.get('/announcements', getAnnouncements);
  *         description: List of notifications
  */
 router.get('/notifications', getNotifications);
+router.put('/notifications/read-all', markAllNotificationsRead);
+router.get('/notifications/preferences', getNotificationPreferences);
+router.put('/notifications/preferences', updateNotificationPreferences);
 
 /**
  * @swagger

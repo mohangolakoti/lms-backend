@@ -21,6 +21,13 @@ const logger = winston.createLogger({
   ],
 });
 
+logger.event = (eventName, metadata = {}) => {
+  logger.info('Operational event', {
+    event: eventName,
+    ...metadata,
+  });
+};
+
 if (process.env.NODE_ENV !== 'production') {
   logger.add(new winston.transports.Console({
     format: winston.format.combine(

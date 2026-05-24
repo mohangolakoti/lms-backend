@@ -7,6 +7,7 @@ const {
   logout,
   getSessions,
   revokeSession,
+  revokeAllSessions,
   getMe,
   forgotPassword,
   resetPassword,
@@ -153,6 +154,7 @@ router.post('/logout', protect, logout);
  *         description: Active sessions retrieved
  */
 router.get('/sessions', protect, getSessions);
+router.delete('/sessions', protect, revokeAllSessions);
 
 /**
  * @swagger
@@ -244,7 +246,12 @@ router.post('/forgotpassword', authLimiter, forgotPassword);
  *       400:
  *         description: Invalid token
  */
-router.put('/resetpassword/:resettoken', authLimiter, resetPassword);
+router.put('/resetpassword/:resettoken', authLimiter, [
+  body('password')
+    .isLength({ min: 8, max: 64 }).withMessage('Password must be 8-64 characters')
+    .matches(/^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[^A-Za-z\d]).+$/)
+    .withMessage('Password must include uppercase, lowercase, number, and special character'),
+], validate, resetPassword);
 
 /**
  * @swagger
@@ -277,7 +284,10 @@ router.put('/resetpassword/:resettoken', authLimiter, resetPassword);
  */
 router.put('/updatepassword', protect, [
   body('currentPassword').notEmpty().withMessage('Current password is required'),
-  body('newPassword').isLength({ min: 6 }).withMessage('New password must be at least 6 characters'),
+  body('newPassword')
+    .isLength({ min: 8, max: 64 }).withMessage('New password must be 8-64 characters')
+    .matches(/^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[^A-Za-z\d]).+$/)
+    .withMessage('New password must include uppercase, lowercase, number, and special character'),
 ], validate, updatePassword);
 
 module.exports = router;

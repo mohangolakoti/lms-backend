@@ -1,11 +1,15 @@
 const fs = require('fs/promises');
 const path = require('path');
 const mongoose = require('mongoose');
+const crypto = require('crypto');
 const User = require('../models/User');
 const Batch = require('../models/Batch');
 const Certificate = require('../models/Certificate');
 const CertificateTemplate = require('../models/CertificateTemplate');
+const CertificateJob = require('../models/CertificateJob');
 const ResponseHandler = require('../utils/responseHandler');
+const logger = require('../utils/logger');
+const { setProcessor, enqueue } = require('../utils/certificateQueue');
 const { ValidationError, NotFoundError, ForbiddenError } = require('../utils/errors');
 const {
   defaultHtmlTemplate,
@@ -286,10 +290,7 @@ exports.previewCertificate = async (req, res, next) => {
   }
 };
 
-// @desc    Generate certificates (batch or individual)
-// @route   POST /api/certificates/generate
-// @access  Private/Admin
-exports.generateCertificates = async (req, res, next) => {
+const executeCertificateGeneration = async (payload) => {
   const {
     mode,
     batchId,
@@ -299,11 +300,10 @@ exports.generateCertificates = async (req, res, next) => {
     durationText,
     completionDate,
     forceRegenerate = false,
-  } = req.body;
-
+  } = payload;
   let browser;
 
-  try {
+  try {    
     const normalizedMode = normalizeMode(mode);
     const normalizedCertificateName = String(certificateName || '').trim();
     const normalizedDuration = String(durationText || '').trim();
@@ -327,19 +327,15 @@ exports.generateCertificates = async (req, res, next) => {
       .lean();
 
     if (!students.length) {
-      return ResponseHandler.success(
-        res,
-        {
-          mode: normalizedMode,
-          generatedCount: 0,
-          skippedCount: 0,
-          errorCount: 0,
-          generatedCertificates: [],
-          skippedStudents: [],
-          errors: [],
-        },
-        'No eligible students found in this batch'
-      );
+      return {
+        mode: normalizedMode,
+        generatedCount: 0,
+        skippedCount: 0,
+        errorCount: 0,
+        generatedCertificates: [],
+        skippedStudents: [],
+        errors: [],
+      };
     }
 
     if (normalizedMode === 'batch') {
@@ -397,29 +393,99 @@ exports.generateCertificates = async (req, res, next) => {
       }
     }
 
-    return ResponseHandler.success(
-      res,
-      {
-        mode: normalizedMode,
-        batchId: normalizedMode === 'batch' ? batchId : undefined,
-        studentId: normalizedMode === 'individual' ? studentId : undefined,
-        certificateName: normalizedCertificateName,
-        duration: normalizedDuration,
-        generatedCount: generatedCertificates.length,
-        skippedCount: skippedStudents.length,
-        errorCount: errors.length,
-        generatedCertificates,
-        skippedStudents,
-        errors,
-      },
-      'Batch certificate generation completed'
-    );
-  } catch (error) {
-    next(error);
+    return {
+      mode: normalizedMode,
+      batchId: normalizedMode === 'batch' ? batchId : undefined,
+      studentId: normalizedMode === 'individual' ? studentId : undefined,
+      certificateName: normalizedCertificateName,
+      duration: normalizedDuration,
+      generatedCount: generatedCertificates.length,
+      skippedCount: skippedStudents.length,
+      errorCount: errors.length,
+      generatedCertificates,
+      skippedStudents,
+      errors,
+    };
   } finally {
     if (browser) {
       await browser.close();
     }
+  }
+};
+
+// @desc    Generate certificates (batch or individual)
+// @route   POST /api/certificates/generate
+// @access  Private/Admin
+exports.generateCertificates = async (req, res, next) => {
+  try {
+    const payload = {
+      mode: req.body.mode,
+      batchId: req.body.batchId,
+      studentId: req.body.studentId,
+      templateId: req.body.templateId,
+      certificateName: req.body.certificateName,
+      durationText: req.body.durationText,
+      completionDate: req.body.completionDate,
+      forceRegenerate: req.body.forceRegenerate || false,
+    };
+
+    const idempotencyKey = crypto
+      .createHash('sha256')
+      .update(JSON.stringify({ requestedBy: req.user.id, payload }))
+      .digest('hex');
+
+    const existing = await CertificateJob.findOne({
+      idempotencyKey,
+      status: { $in: ['queued', 'processing', 'completed'] },
+    }).lean();
+
+    if (existing) {
+      return ResponseHandler.success(res, {
+        jobId: existing._id,
+        status: existing.status,
+        result: existing.result || null,
+        idempotent: true,
+      }, 'Using existing certificate generation job');
+    }
+
+    const job = await enqueue({
+      requestedBy: req.user.id,
+      payload,
+      idempotencyKey,
+      status: 'queued',
+    });
+
+    return ResponseHandler.success(res, {
+      jobId: job._id,
+      status: job.status,
+      idempotent: false,
+    }, 'Certificate generation queued');
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Get certificate generation job status
+// @route   GET /api/certificates/jobs/:jobId
+// @access  Private/Admin
+exports.getCertificateGenerationJob = async (req, res, next) => {
+  try {
+    const job = await CertificateJob.findById(req.params.jobId).lean();
+    if (!job) {
+      throw new NotFoundError('Certificate generation job');
+    }
+
+    return ResponseHandler.success(res, {
+      jobId: job._id,
+      status: job.status,
+      result: job.result,
+      error: job.error,
+      startedAt: job.startedAt,
+      finishedAt: job.finishedAt,
+      createdAt: job.createdAt,
+    });
+  } catch (error) {
+    next(error);
   }
 };
 
@@ -530,3 +596,15 @@ exports.verifyCertificate = async (req, res, next) => {
     next(error);
   }
 };
+
+setProcessor(async (payload) => {
+  logger.event('certificate_job_started', { mode: payload.mode });
+  const result = await executeCertificateGeneration(payload);
+  logger.event('certificate_job_completed', {
+    mode: payload.mode,
+    generatedCount: result.generatedCount,
+    skippedCount: result.skippedCount,
+    errorCount: result.errorCount,
+  });
+  return result;
+});

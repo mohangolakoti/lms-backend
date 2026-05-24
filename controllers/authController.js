@@ -11,6 +11,16 @@ const logger = require('../utils/logger');
 const ResponseHandler = require('../utils/responseHandler');
 const { ValidationError, ConflictError, NotFoundError, UnauthorizedError, ForbiddenError } = require('../utils/errors');
 
+const assertStrongPassword = (password, field = 'Password') => {
+  const value = String(password || '');
+  const strongPattern = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[^A-Za-z\d]).{8,64}$/;
+  if (!strongPattern.test(value)) {
+    throw new ValidationError(
+      `${field} must be 8-64 chars and include uppercase, lowercase, number, and special character`
+    );
+  }
+};
+
 // @desc    Register user
 // @route   POST /api/auth/register
 // @access  Public
@@ -21,10 +31,6 @@ exports.register = async (req, res, next) => {
     // Validation
     if (!name || !email || !password) {
       throw new ValidationError('Name, email, and password are required');
-    }
-
-    if (password.length < 6) {
-      throw new ValidationError('Password must be at least 6 characters');
     }
 
     // Check if user exists
@@ -38,6 +44,8 @@ exports.register = async (req, res, next) => {
     if (requestedRole !== 'student') {
       throw new ForbiddenError('Public registration is only available for students.');
     }
+
+    assertStrongPassword(password);
 
     // Prepare user data
     const userData = {
@@ -89,7 +97,7 @@ exports.register = async (req, res, next) => {
 
     // For admin/instructor, return token immediately
     const sessionId = uuidv4();
-    const token = generateToken(user._id);
+    const token = generateToken(user._id, user.tokenVersion);
     const refreshToken = generateRefreshToken(user._id, user.tokenVersion, sessionId);
     const decodedRefresh = jwt.decode(refreshToken);
 
@@ -181,7 +189,7 @@ exports.login = async (req, res, next) => {
     logger.info(`User logged in: ${user._id}`);
 
     const sessionId = uuidv4();
-    const token = generateToken(user._id);
+    const token = generateToken(user._id, user.tokenVersion);
     const refreshToken = generateRefreshToken(user._id, user.tokenVersion, sessionId);
     const decodedRefresh = jwt.decode(refreshToken);
 
@@ -267,7 +275,7 @@ exports.refresh = async (req, res, next) => {
       }
     }
 
-    const newAccessToken = generateToken(user._id);
+    const newAccessToken = generateToken(user._id, user.tokenVersion);
     const newRefreshToken = generateRefreshToken(user._id, user.tokenVersion, decoded.sessionId);
     const newDecodedRefresh = jwt.decode(newRefreshToken);
 
@@ -380,6 +388,26 @@ exports.revokeSession = async (req, res, next) => {
   }
 };
 
+// @desc    Revoke all active sessions for current user
+// @route   DELETE /api/auth/sessions
+// @access  Private
+exports.revokeAllSessions = async (req, res, next) => {
+  try {
+    const result = await RefreshSession.updateMany(
+      { userId: req.user.id, isRevoked: false },
+      { $set: { isRevoked: true, revokedAt: new Date() } }
+    );
+
+    await User.findByIdAndUpdate(req.user.id, { $inc: { tokenVersion: 1 } });
+
+    return ResponseHandler.success(res, {
+      revokedSessions: result.modifiedCount || 0,
+    }, 'All sessions revoked');
+  } catch (error) {
+    return next(error);
+  }
+};
+
 // @desc    Forgot password
 // @route   POST /api/auth/forgotpassword
 // @access  Public
@@ -462,6 +490,7 @@ exports.resetPassword = async (req, res, next) => {
     }
 
     // Set new password
+    assertStrongPassword(req.body.password, 'New password');
     user.password = req.body.password;
     user.tokenVersion = (user.tokenVersion || 0) + 1;
     user.passwordResetToken = undefined;
@@ -472,7 +501,7 @@ exports.resetPassword = async (req, res, next) => {
       { $set: { isRevoked: true, revokedAt: new Date() } }
     );
 
-    const token = generateToken(user._id);
+    const token = generateToken(user._id, user.tokenVersion);
     const sessionId = uuidv4();
     const refreshToken = generateRefreshToken(user._id, user.tokenVersion, sessionId);
     const decodedRefresh = jwt.decode(refreshToken);
@@ -518,6 +547,7 @@ exports.updatePassword = async (req, res, next) => {
       });
     }
 
+    assertStrongPassword(req.body.newPassword, 'New password');
     user.password = req.body.newPassword;
     user.tokenVersion = (user.tokenVersion || 0) + 1;
     await user.save();
@@ -526,7 +556,7 @@ exports.updatePassword = async (req, res, next) => {
       { $set: { isRevoked: true, revokedAt: new Date() } }
     );
 
-    const token = generateToken(user._id);
+    const token = generateToken(user._id, user.tokenVersion);
     const sessionId = uuidv4();
     const refreshToken = generateRefreshToken(user._id, user.tokenVersion, sessionId);
     const decodedRefresh = jwt.decode(refreshToken);

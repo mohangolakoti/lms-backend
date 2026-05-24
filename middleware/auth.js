@@ -30,6 +30,13 @@ exports.protect = async (req, res, next) => {
       });
     }
 
+    if ((decoded.tokenVersion ?? 0) !== (req.user.tokenVersion ?? 0)) {
+      return res.status(401).json({
+        success: false,
+        error: 'Session expired. Please login again.',
+      });
+    }
+
     // Check if user is blocked
     if (req.user.status === 'blocked') {
       return res.status(403).json({

@@ -8,6 +8,7 @@ const {
   getTemplates,
   previewCertificate,
   generateCertificates,
+  getCertificateGenerationJob,
   getMyCertificates,
   getCertificatesForAdmin,
   downloadCertificate,
@@ -69,5 +70,7 @@ router.post(
   validate,
   generateCertificates
 );
+
+router.get('/jobs/:jobId', authorize('admin'), getCertificateGenerationJob);
 
 module.exports = router;

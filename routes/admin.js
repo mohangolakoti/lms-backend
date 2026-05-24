@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const {
   getDashboard,
+  getOperationalReports,
   getStudents,
   getStudent,
   updateStudentStatus,
@@ -41,6 +42,7 @@ router.use(authorize('admin'));
  *         description: Dashboard statistics
  */
 router.get('/dashboard', getDashboard);
+router.get('/reports/operational', getOperationalReports);
 
 /**
  * @swagger

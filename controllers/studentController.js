@@ -4,6 +4,7 @@ const Assessment = require('../models/Assessment');
 const Submission = require('../models/Submission');
 const Announcement = require('../models/Announcement');
 const Notification = require('../models/Notification');
+const NotificationPreference = require('../models/NotificationPreference');
 const User = require('../models/User');
 
 // @desc    Get student dashboard
@@ -374,14 +375,15 @@ exports.updateLessonProgress = async (req, res, next) => {
         }
       }
       if (lastWatchedSecond !== undefined) {
-        progress.lessonProgress[lessonProgIndex].lastWatchedSecond = lastWatchedSecond;
+        const clampedTime = Math.max(0, Math.floor(lastWatchedSecond));
+        progress.lessonProgress[lessonProgIndex].lastWatchedSecond = clampedTime;
       }
     } else {
       previousTime = 0;
       progress.lessonProgress.push({
         lessonId,
         completed: completed || false,
-        lastWatchedSecond: lastWatchedSecond || 0,
+        lastWatchedSecond: Math.max(0, Math.floor(lastWatchedSecond || 0)),
         completedAt: completed ? Date.now() : undefined,
       });
     }
@@ -407,11 +409,12 @@ exports.updateLessonProgress = async (req, res, next) => {
     // Calculate overall course percentage
     const totalLessons = course.modules.reduce((sum, m) => sum + m.lessons.length, 0);
     const completedLessonsCount = progress.lessonProgress.filter(lp => lp.completed).length;
-    progress.overallCoursePercentage = (completedLessonsCount / totalLessons) * 100;
+    progress.overallCoursePercentage = Math.min(100, (completedLessonsCount / totalLessons) * 100);
 
     // Update time spent if provided
     if (lastWatchedSecond !== undefined) {
-      const timeDiff = lastWatchedSecond - previousTime;
+      const clampedTime = Math.max(0, Math.floor(lastWatchedSecond));
+      const timeDiff = clampedTime - previousTime;
       if (timeDiff > 0) {
         progress.totalTimeSpent += timeDiff;
       }
@@ -469,15 +472,18 @@ exports.getAssessments = async (req, res, next) => {
         s => s.assessmentId.toString() === assessment._id.toString()
       );
 
+      const sanitizedQuestions = (assessment.questions || []).map(({ correctAnswer, ...question }) => question);
+
       return {
         ...assessment.toObject(),
+        questions: sanitizedQuestions,
         submitted: !!submission,
         submission: submission ? {
           score: submission.score,
           percentage: submission.percentage,
           passed: submission.passed,
           submittedAt: submission.submittedAt,
-          answers: submission.answers, // Include answers for result display
+          answers: submission.answers,
         } : null,
       };
     });
@@ -485,6 +491,65 @@ exports.getAssessments = async (req, res, next) => {
     res.status(200).json({
       success: true,
       data: assessmentsWithStatus,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Get assessment by id for student
+// @route   GET /api/students/assessments/:assessmentId
+// @access  Private/Student
+exports.getAssessmentById = async (req, res, next) => {
+  try {
+    const { assessmentId } = req.params;
+    const userId = req.user.id;
+
+    const assessment = await Assessment.findById(assessmentId)
+      .populate('courseId', 'title term batches visibility')
+      .populate('createdBy', 'name');
+
+    if (!assessment || assessment.visibility !== 'published') {
+      return res.status(404).json({
+        success: false,
+        error: 'Assessment not found',
+      });
+    }
+
+    const user = await User.findById(userId).populate('batchId');
+    if (!user || !user.batchId) {
+      return res.status(403).json({
+        success: false,
+        error: 'No batch assigned',
+      });
+    }
+
+    const termMatch = assessment.courseId?.term === user.batch || assessment.courseId?.term === 'both';
+    const batchMatch = assessment.courseId?.batches?.some((batch) => batch.toString() === user.batchId._id.toString());
+    if (!termMatch || !batchMatch) {
+      return res.status(403).json({
+        success: false,
+        error: 'You do not have access to this assessment',
+      });
+    }
+
+    const submission = await Submission.findOne({ userId, assessmentId });
+    const sanitizedQuestions = (assessment.questions || []).map(({ correctAnswer, ...question }) => question);
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        ...assessment.toObject(),
+        questions: sanitizedQuestions,
+        submitted: !!submission,
+        submission: submission ? {
+          score: submission.score,
+          percentage: submission.percentage,
+          passed: submission.passed,
+          submittedAt: submission.submittedAt,
+          answers: submission.answers,
+        } : null,
+      },
     });
   } catch (error) {
     next(error);
@@ -500,11 +565,43 @@ exports.submitAssessment = async (req, res, next) => {
     const userId = req.user.id;
     const { answers, timeTaken } = req.body;
 
+    if (!Array.isArray(answers) || answers.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'At least one answer is required',
+      });
+    }
+
+    if (typeof timeTaken !== 'number' || Number.isNaN(timeTaken) || timeTaken < 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'timeTaken must be a valid non-negative number',
+      });
+    }
+
     const assessment = await Assessment.findById(assessmentId);
     if (!assessment) {
       return res.status(404).json({
         success: false,
         error: 'Assessment not found',
+      });
+    }
+
+    const user = await User.findById(userId).populate('batchId');
+    const course = await Course.findById(assessment.courseId).select('term batches visibility');
+    if (!user || !user.batchId || !course || course.visibility !== 'published') {
+      return res.status(403).json({
+        success: false,
+        error: 'You do not have access to this assessment',
+      });
+    }
+
+    const termMatch = course.term === user.batch || course.term === 'both';
+    const batchMatch = course.batches.some((batch) => batch.toString() === user.batchId._id.toString());
+    if (!termMatch || !batchMatch) {
+      return res.status(403).json({
+        success: false,
+        error: 'You do not have access to this assessment',
       });
     }
 
@@ -519,9 +616,10 @@ exports.submitAssessment = async (req, res, next) => {
 
     // Calculate score
     let score = 0;
-    const processedAnswers = answers.map((answer, index) => {
+    const processedAnswers = answers.map((answer) => {
       // Convert questionId to number for array indexing
       const questionIndex = parseInt(answer.questionId);
+      if (Number.isNaN(questionIndex)) return null;
       const question = assessment.questions[questionIndex];
       if (!question) return null;
 
@@ -550,16 +648,27 @@ exports.submitAssessment = async (req, res, next) => {
     const percentage = (score / assessment.totalMarks) * 100;
     const passed = percentage >= (assessment.passingMarks / assessment.totalMarks) * 100;
 
-    const submission = await Submission.create({
-      userId,
-      assessmentId,
-      answers: processedAnswers,
-      score,
-      totalMarks: assessment.totalMarks,
-      percentage,
-      passed,
-      timeTaken,
-    });
+    let submission;
+    try {
+      submission = await Submission.create({
+        userId,
+        assessmentId,
+        answers: processedAnswers,
+        score,
+        totalMarks: assessment.totalMarks,
+        percentage,
+        passed,
+        timeTaken,
+      });
+    } catch (dbError) {
+      if (dbError.code === 11000) {
+        return res.status(400).json({
+          success: false,
+          error: 'Assessment already submitted',
+        });
+      }
+      throw dbError;
+    }
 
     res.status(201).json({
       success: true,
@@ -618,20 +727,32 @@ exports.getAnnouncements = async (req, res, next) => {
 exports.getNotifications = async (req, res, next) => {
   try {
     const userId = req.user.id;
-    const { read } = req.query;
+    const { read, page = 1, limit = 50 } = req.query;
 
     const query = { userId };
     if (read !== undefined) {
       query.read = read === 'true';
     }
 
+    const safeLimit = Math.min(Math.max(parseInt(limit, 10) || 50, 1), 100);
+    const skip = (Math.max(parseInt(page, 10) || 1, 1) - 1) * safeLimit;
+
     const notifications = await Notification.find(query)
       .sort({ createdAt: -1 })
-      .limit(50);
+      .skip(skip)
+      .limit(safeLimit);
+
+    const total = await Notification.countDocuments(query);
 
     res.status(200).json({
       success: true,
       data: notifications,
+      pagination: {
+        page: Math.max(parseInt(page, 10) || 1, 1),
+        limit: safeLimit,
+        total,
+        pages: Math.ceil(total / safeLimit),
+      },
     });
   } catch (error) {
     next(error);
@@ -665,6 +786,79 @@ exports.markNotificationRead = async (req, res, next) => {
     res.status(200).json({
       success: true,
       data: notification,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Mark all notifications as read
+// @route   PUT /api/students/notifications/read-all
+// @access  Private/Student
+exports.markAllNotificationsRead = async (req, res, next) => {
+  try {
+    const userId = req.user.id;
+    const now = Date.now();
+
+    const result = await Notification.updateMany(
+      { userId, read: false },
+      { $set: { read: true, readAt: now } }
+    );
+
+    res.status(200).json({
+      success: true,
+      data: {
+        modifiedCount: result.modifiedCount || 0,
+      },
+      message: 'All notifications marked as read',
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Get notification preferences
+// @route   GET /api/students/notifications/preferences
+// @access  Private/Student
+exports.getNotificationPreferences = async (req, res, next) => {
+  try {
+    let preferences = await NotificationPreference.findOne({ userId: req.user.id });
+    if (!preferences) {
+      preferences = await NotificationPreference.create({ userId: req.user.id });
+    }
+
+    res.status(200).json({
+      success: true,
+      data: preferences,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Update notification preferences
+// @route   PUT /api/students/notifications/preferences
+// @access  Private/Student
+exports.updateNotificationPreferences = async (req, res, next) => {
+  try {
+    const { channels = {} } = req.body;
+
+    const preferences = await NotificationPreference.findOneAndUpdate(
+      { userId: req.user.id },
+      {
+        $set: {
+          'channels.portal': channels.portal ?? true,
+          'channels.email': channels.email ?? true,
+          'channels.whatsapp': channels.whatsapp ?? false,
+        },
+      },
+      { new: true, upsert: true, setDefaultsOnInsert: true }
+    );
+
+    res.status(200).json({
+      success: true,
+      data: preferences,
+      message: 'Notification preferences updated',
     });
   } catch (error) {
     next(error);
