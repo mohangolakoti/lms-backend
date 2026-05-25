@@ -53,6 +53,28 @@ const ensureCourseAccess = async ({ course, req, requireEditor = false, errorMes
   return { ok: true, role };
 };
 
+const normalizeModuleOrders = (course, moduleOrder = []) => {
+  const orderMap = new Map(moduleOrder.map((item, index) => [String(item), index + 1]));
+
+  course.modules.forEach((module, index) => {
+    const mappedOrder = orderMap.get(String(module._id));
+    module.order = mappedOrder || (index + 1);
+  });
+
+  course.modules.sort((a, b) => a.order - b.order);
+};
+
+const normalizeLessonOrders = (module, lessonOrder = []) => {
+  const orderMap = new Map(lessonOrder.map((item, index) => [String(item), index + 1]));
+
+  module.lessons.forEach((lesson, index) => {
+    const mappedOrder = orderMap.get(String(lesson._id));
+    lesson.order = mappedOrder || (index + 1);
+  });
+
+  module.lessons.sort((a, b) => a.order - b.order);
+};
+
 // @desc    Get instructor dashboard
 // @route   GET /api/instructors/dashboard
 // @access  Private/Instructor
@@ -460,6 +482,96 @@ exports.deleteLesson = async (req, res, next) => {
   }
 };
 
+// @desc    Reorder modules in a course
+// @route   PUT /api/instructors/courses/:courseId/modules/reorder
+// @access  Private/Instructor
+exports.reorderModules = async (req, res, next) => {
+  try {
+    const { courseId } = req.params;
+    const { moduleOrder } = req.body;
+
+    if (!Array.isArray(moduleOrder) || moduleOrder.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'moduleOrder must be a non-empty array',
+      });
+    }
+
+    const course = await Course.findById(courseId);
+    if (!course) {
+      return res.status(404).json({
+        success: false,
+        error: 'Course not found',
+      });
+    }
+
+    const access = await ensureCourseAccess({ course, req, requireEditor: true });
+    if (!access.ok) {
+      return res.status(access.status).json(access.payload);
+    }
+
+    normalizeModuleOrders(course, moduleOrder);
+    await course.save();
+
+    return res.status(200).json({
+      success: true,
+      data: course,
+      message: 'Modules reordered successfully',
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Reorder lessons in a module
+// @route   PUT /api/instructors/courses/:courseId/modules/:moduleId/lessons/reorder
+// @access  Private/Instructor
+exports.reorderLessons = async (req, res, next) => {
+  try {
+    const { courseId, moduleId } = req.params;
+    const { lessonOrder } = req.body;
+
+    if (!Array.isArray(lessonOrder) || lessonOrder.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'lessonOrder must be a non-empty array',
+      });
+    }
+
+    const course = await Course.findById(courseId);
+    if (!course) {
+      return res.status(404).json({
+        success: false,
+        error: 'Course not found',
+      });
+    }
+
+    const access = await ensureCourseAccess({ course, req, requireEditor: true });
+    if (!access.ok) {
+      return res.status(access.status).json(access.payload);
+    }
+
+    const module = course.modules.id(moduleId);
+    if (!module) {
+      return res.status(404).json({
+        success: false,
+        error: 'Module not found',
+      });
+    }
+
+    normalizeLessonOrders(module, lessonOrder);
+    await course.save();
+
+    return res.status(200).json({
+      success: true,
+      data: course,
+      message: 'Lessons reordered successfully',
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
 // @desc    Create assessment
 // @route   POST /api/instructors/assessments
 // @access  Private/Instructor
@@ -537,6 +649,82 @@ exports.getAssessments = async (req, res, next) => {
     res.status(200).json({
       success: true,
       data: assessments,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Get analytics for a specific assessment
+// @route   GET /api/instructors/assessments/:assessmentId/analytics
+// @access  Private/Instructor
+exports.getAssessmentAnalytics = async (req, res, next) => {
+  try {
+    const { assessmentId } = req.params;
+    const assessment = await Assessment.findById(assessmentId).populate('courseId', 'title');
+
+    if (!assessment) {
+      return res.status(404).json({
+        success: false,
+        error: 'Assessment not found',
+      });
+    }
+
+    const course = await Course.findById(assessment.courseId?._id || assessment.courseId);
+    if (!course) {
+      return res.status(403).json({
+        success: false,
+        error: 'Not authorized',
+      });
+    }
+
+    const access = await ensureCourseAccess({ course, req });
+    if (!access.ok) {
+      return res.status(403).json({
+        success: false,
+        error: 'Not authorized',
+      });
+    }
+
+    const submissions = await Submission.find({ assessmentId }).select('score totalMarks percentage passed timeTaken submittedAt');
+    const totalAttempts = submissions.length;
+    const passCount = submissions.filter((submission) => submission.passed).length;
+    const failCount = totalAttempts - passCount;
+    const averageScore = totalAttempts > 0
+      ? submissions.reduce((sum, submission) => sum + (submission.percentage || 0), 0) / totalAttempts
+      : 0;
+    const averageTimeTaken = totalAttempts > 0
+      ? submissions.reduce((sum, submission) => sum + (submission.timeTaken || 0), 0) / totalAttempts
+      : 0;
+
+    const attemptsByDay = submissions.reduce((acc, submission) => {
+      const key = new Date(submission.submittedAt).toISOString().slice(0, 10);
+      acc[key] = (acc[key] || 0) + 1;
+      return acc;
+    }, {});
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        assessment: {
+          _id: assessment._id,
+          title: assessment.title,
+          courseTitle: assessment.courseId?.title || '',
+          totalMarks: assessment.totalMarks,
+          passingMarks: assessment.passingMarks,
+        },
+        totals: {
+          totalAttempts,
+          passCount,
+          failCount,
+          passRate: totalAttempts > 0 ? (passCount / totalAttempts) * 100 : 0,
+          averageScore,
+          averageTimeTaken,
+        },
+        trend: Object.entries(attemptsByDay)
+          .sort((a, b) => a[0].localeCompare(b[0]))
+          .map(([date, attempts]) => ({ date, attempts })),
+      },
     });
   } catch (error) {
     next(error);

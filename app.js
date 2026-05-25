@@ -42,11 +42,10 @@ const configuredOrigins = new Set([
   ...parseConfiguredOrigins(),
 ]);
 
-const isLocalOrigin = (origin) => /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(origin);
+const isLocalOrigin = (origin) => /^https?:\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])(:\d+)?$/i.test(origin);
 const isVercelPreviewOrigin = (origin) => /^https:\/\/[a-z0-9-]+\.vercel\.app$/i.test(origin);
 
-app.use(helmet());
-app.use(cors({
+const corsOptions = {
   origin: (origin, callback) => {
     // Allow non-browser clients and same-origin requests with no Origin header.
     if (!origin) {
@@ -58,13 +57,22 @@ app.use(cors({
       || isLocalOrigin(normalized)
       || isVercelPreviewOrigin(normalized);
 
-    return callback(null, isAllowed);
+    if (isAllowed) {
+      return callback(null, true);
+    }
+
+    return callback(new Error(`CORS blocked for origin: ${origin}`));
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Request-Id'],
+  // Let cors package reflect requested preflight headers automatically.
+  // This avoids local-dev breakage from browser/client-hint header variations.
   optionsSuccessStatus: 200,
-}));
+};
+
+app.use(helmet());
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));

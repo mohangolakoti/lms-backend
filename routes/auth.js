@@ -22,7 +22,10 @@ const { body } = require('express-validator');
 const registerValidation = [
   body('name').trim().notEmpty().withMessage('Name is required'),
   body('email').isEmail().withMessage('Please provide a valid email'),
-  body('password').isLength({ min: 6 }).withMessage('Password must be at least 6 characters'),
+  body('password')
+    .isLength({ min: 8, max: 64 }).withMessage('Password must be 8-64 characters')
+    .matches(/^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[^A-Za-z\d]).+$/)
+    .withMessage('Password must include uppercase, lowercase, number, and special character'),
 ];
 
 const loginValidation = [

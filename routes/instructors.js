@@ -11,8 +11,11 @@ const {
   addLesson,
   updateLesson,
   deleteLesson,
+  reorderModules,
+  reorderLessons,
   createAssessment,
   getAssessments,
+  getAssessmentAnalytics,
   getCourseProgress,
   getSubmissions,
   gradeSubmission,
@@ -189,6 +192,9 @@ router.post('/courses/:id/modules', [
  */
 router.put('/courses/:courseId/modules/:moduleId', updateModule);
 router.delete('/courses/:courseId/modules/:moduleId', deleteModule);
+router.put('/courses/:courseId/modules/reorder', [
+  body('moduleOrder').isArray({ min: 1 }).withMessage('moduleOrder must be a non-empty array'),
+], validate, reorderModules);
 
 /**
  * @swagger
@@ -297,6 +303,9 @@ router.post('/courses/:courseId/modules/:moduleId/lessons', [
  */
 router.put('/courses/:courseId/modules/:moduleId/lessons/:lessonId', updateLesson);
 router.delete('/courses/:courseId/modules/:moduleId/lessons/:lessonId', deleteLesson);
+router.put('/courses/:courseId/modules/:moduleId/lessons/reorder', [
+  body('lessonOrder').isArray({ min: 1 }).withMessage('lessonOrder must be a non-empty array'),
+], validate, reorderLessons);
 
 /**
  * @swagger
@@ -369,6 +378,7 @@ router.post('/assessments', [
     .isNumeric().withMessage('Passing marks must be a number'),
 ], validate, createAssessment);
 router.get('/assessments', getAssessments);
+router.get('/assessments/:assessmentId/analytics', getAssessmentAnalytics);
 
 /**
  * @swagger

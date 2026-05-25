@@ -43,7 +43,7 @@ describe('Phase B auth and approval integrations', () => {
       .send({
         name: 'Malicious Admin',
         email: 'bad-admin@example.com',
-        password: 'password123',
+        password: 'Password@123',
         role: 'admin',
         batch: 'longTerm',
       });

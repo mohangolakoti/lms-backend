@@ -19,6 +19,7 @@ const {
 } = require('../utils/courseInstructorService');
 const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
+const PaginationHelper = require('../utils/paginationHelper');
 
 const DASHBOARD_CACHE_TTL_MS = 60 * 1000;
 let dashboardCache = { data: null, expiresAt: 0 };
@@ -178,7 +179,7 @@ exports.getOperationalReports = async (req, res, next) => {
 // @access  Private/Admin
 exports.getStudents = async (req, res, next) => {
   try {
-    const { status, batch, search, approvalStatus, batchId } = req.query;
+    const { status, batch, search, approvalStatus, batchId, page = 1, limit = 20 } = req.query;
     const query = { role: 'student' };
 
     if (status) query.status = status;
@@ -192,15 +193,21 @@ exports.getStudents = async (req, res, next) => {
       ];
     }
 
+    const total = await User.countDocuments(query);
+    const { page: pageNum, limit: pageLimit, skip } = PaginationHelper.getPaginationParams(page, limit);
+
     const students = await User.find(query)
       .select('-password')
       .populate('batchId', 'name isActive')
-      .sort({ createdAt: -1 });
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(pageLimit);
 
     res.status(200).json({
       success: true,
       data: students,
       count: students.length,
+      pagination: PaginationHelper.getPaginationMeta(total, pageNum, pageLimit),
     });
   } catch (error) {
     next(error);
