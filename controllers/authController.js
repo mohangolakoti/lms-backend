@@ -21,6 +21,22 @@ const assertStrongPassword = (password, field = 'Password') => {
   }
 };
 
+const selectDeterministicActiveBatch = (activeBatches, requestedTerm, seedValue) => {
+  if (!activeBatches.length) return null;
+  if (activeBatches.length === 1) return activeBatches[0];
+
+  const termToken = requestedTerm === 'longTerm' ? 'long' : 'short';
+  const termMatched = activeBatches.filter((batch) => String(batch.name || '').includes(termToken));
+  const candidates = termMatched.length ? termMatched : activeBatches;
+
+  const hash = crypto
+    .createHash('sha256')
+    .update(`${seedValue}:${requestedTerm}`)
+    .digest('hex');
+  const index = parseInt(hash.slice(0, 8), 16) % candidates.length;
+  return candidates[index];
+};
+
 // @desc    Register user
 // @route   POST /api/auth/register
 // @access  Public
@@ -63,16 +79,18 @@ exports.register = async (req, res, next) => {
         throw new ValidationError('Valid batch term (longTerm or shortTerm) is required for students');
       }
 
-      // Get the latest active batch
-      const activeBatch = await Batch.findOne({ isActive: true, isDeleted: false })
-        .sort({ createdAt: -1 });
-      
-      if (!activeBatch) {
+      const activeBatches = await Batch.find({ isActive: true, isDeleted: false })
+        .sort({ createdAt: 1, _id: 1 })
+        .select('_id name');
+
+      if (!activeBatches.length) {
         throw new NotFoundError('No active batch available for student registration');
       }
 
+      const selectedBatch = selectDeterministicActiveBatch(activeBatches, batch, email.toLowerCase().trim());
+
       userData.batch = batch;
-      userData.batchId = activeBatch._id;
+      userData.batchId = selectedBatch._id;
       userData.approvalStatus = 'pending'; // Students are pending by default
     }
 

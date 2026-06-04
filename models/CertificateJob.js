@@ -42,5 +42,7 @@ const certificateJobSchema = new mongoose.Schema({
 }, { timestamps: true });
 
 certificateJobSchema.index({ createdAt: 1 }, { expireAfterSeconds: 7 * 24 * 60 * 60 });
+certificateJobSchema.index({ status: 1, startedAt: 1 });
+certificateJobSchema.index({ requestedBy: 1, createdAt: -1 });
 
 module.exports = mongoose.model('CertificateJob', certificateJobSchema);

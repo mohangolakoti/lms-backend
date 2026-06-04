@@ -60,6 +60,25 @@ const certificateSchema = new mongoose.Schema(
       default: Date.now,
       index: true,
     },
+    isRevoked: {
+      type: Boolean,
+      default: false,
+      index: true,
+    },
+    revokedAt: {
+      type: Date,
+      default: null,
+    },
+    revokedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      default: null,
+    },
+    revocationReason: {
+      type: String,
+      default: '',
+      trim: true,
+    },
   },
   {
     timestamps: true,

@@ -34,6 +34,10 @@ const buildPrimaryInstructorId = (assignments = [], fallbackInstructorId = null)
   return (editorAssignment || assignments[0]).instructorId;
 };
 
+const hasAtLeastOneEditor = (assignments = []) => {
+  return assignments.some((assignment) => assignment.role === 'editor');
+};
+
 const syncCourseInstructors = async (courseId, assignments = []) => {
   await CourseInstructor.deleteMany({ course_id: courseId });
 
@@ -92,6 +96,7 @@ const getCourseAssignmentsMap = async (courseIds = []) => {
 module.exports = {
   normalizeAssignments,
   buildPrimaryInstructorId,
+  hasAtLeastOneEditor,
   syncCourseInstructors,
   getCourseRoleForUser,
   getCourseAssignmentsMap,

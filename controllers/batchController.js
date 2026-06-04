@@ -1,5 +1,6 @@
 const Batch = require('../models/Batch');
 const Student = require('../models/User');
+const Course = require('../models/Course');
 const logger = require('../utils/logger');
 const ResponseHandler = require('../utils/responseHandler');
 const PaginationHelper = require('../utils/paginationHelper');
@@ -53,30 +54,62 @@ exports.createBatch = async (req, res, next) => {
  */
 exports.getAllBatches = async (req, res, next) => {
   try {
-    const { isActive, page, limit, sortBy, sortOrder } = req.query;
+    const { isActive, page, limit, sortBy, sortOrder, includeDeleted, onlyDeleted } = req.query;
 
     // Build filter
     const filter = QueryOptimizer.buildFilter(
       { isActive: isActive !== undefined ? isActive === 'true' : undefined },
       ['isActive']
     );
+    if (onlyDeleted === 'true') {
+      filter.isDeleted = true;
+    } else if (includeDeleted !== 'true') {
+      filter.isDeleted = { $ne: true };
+    }
+
+    const batchQueryBase = includeDeleted === 'true' || onlyDeleted === 'true'
+      ? Batch.withDeleted()
+      : Batch.find();
 
     // Get total count
-    const total = await Batch.countDocuments(filter);
+    const total = await Batch.withDeleted().countDocuments(filter);
 
     // Get pagination params
     const { page: pageNum, limit: pageLimit, skip } = PaginationHelper.getPaginationParams(page, limit);
 
     // Build and execute query
-    const batches = await Batch.find(filter)
+    const batches = await batchQueryBase.find(filter)
       .sort(QueryOptimizer.buildSort(sortBy || 'createdAt', sortOrder || -1))
       .skip(skip)
       .limit(pageLimit)
       .lean();
 
+    const batchIds = batches.map((batch) => batch._id);
+    const [studentCounts, courseCounts] = await Promise.all([
+      Student.aggregate([
+        { $match: { role: 'student', batchId: { $in: batchIds } } },
+        { $group: { _id: '$batchId', count: { $sum: 1 } } },
+      ]),
+      Course.aggregate([
+        { $match: { batches: { $in: batchIds } } },
+        { $unwind: '$batches' },
+        { $match: { batches: { $in: batchIds } } },
+        { $group: { _id: '$batches', count: { $sum: 1 } } },
+      ]),
+    ]);
+    const studentCountMap = new Map(studentCounts.map((row) => [String(row._id), row.count]));
+    const courseCountMap = new Map(courseCounts.map((row) => [String(row._id), row.count]));
+    const batchesWithDeps = batches.map((batch) => ({
+      ...batch,
+      dependencyStats: {
+        students: studentCountMap.get(String(batch._id)) || 0,
+        courses: courseCountMap.get(String(batch._id)) || 0,
+      },
+    }));
+
     const pagination = PaginationHelper.getPaginationMeta(total, pageNum, pageLimit);
 
-    return ResponseHandler.paginated(res, batches, pagination);
+    return ResponseHandler.paginated(res, batchesWithDeps, pagination);
   } catch (error) {
     next(error);
   }
@@ -165,6 +198,17 @@ exports.deleteBatch = async (req, res, next) => {
     // Don't allow deletion of active batch
     if (batch.isActive) {
       throw new ValidationError('Cannot delete an active batch. Deactivate it first.');
+    }
+
+    const [studentRefs, courseRefs] = await Promise.all([
+      Student.countDocuments({ role: 'student', batchId: batch._id }),
+      Course.countDocuments({ batches: batch._id }),
+    ]);
+
+    if (studentRefs > 0 || courseRefs > 0) {
+      throw new ValidationError(
+        `Cannot delete batch. It is referenced by ${studentRefs} student(s) and ${courseRefs} course(s).`
+      );
     }
 
     if (hardDelete === 'true') {

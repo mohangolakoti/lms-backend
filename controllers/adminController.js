@@ -8,18 +8,21 @@ const Notification = require('../models/Notification');
 const NotificationPreference = require('../models/NotificationPreference');
 const Batch = require('../models/Batch');
 const CourseInstructor = require('../models/CourseInstructor');
+const AdminAuditLog = require('../models/AdminAuditLog');
 const sendEmail = require('../utils/sendEmail');
 const { sendBatchWhatsAppMessages } = require('../utils/whatsappService');
 const logger = require('../utils/logger');
 const {
   normalizeAssignments,
   buildPrimaryInstructorId,
+  hasAtLeastOneEditor,
   syncCourseInstructors,
   getCourseAssignmentsMap,
 } = require('../utils/courseInstructorService');
 const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
 const PaginationHelper = require('../utils/paginationHelper');
+const { logAdminAction } = require('../utils/adminAudit');
 
 const DASHBOARD_CACHE_TTL_MS = 60 * 1000;
 let dashboardCache = { data: null, expiresAt: 0 };
@@ -27,6 +30,10 @@ let dashboardCache = { data: null, expiresAt: 0 };
 const validateInstructorAssignments = async (assignments = []) => {
   if (!assignments.length) {
     return 'At least one instructor must be assigned';
+  }
+
+  if (!hasAtLeastOneEditor(assignments)) {
+    return 'At least one assigned instructor must have editor role';
   }
 
   const instructorIds = assignments.map((item) => item.instructorId);
@@ -37,6 +44,25 @@ const validateInstructorAssignments = async (assignments = []) => {
 
   if (instructors.length !== assignments.length) {
     return 'One or more assigned instructors are invalid';
+  }
+
+  return null;
+};
+
+const validateCourseBatches = async (batchIds = []) => {
+  if (!Array.isArray(batchIds) || batchIds.length === 0) {
+    return 'At least one batch must be assigned';
+  }
+
+  const uniqueBatchIds = [...new Set(batchIds.map((batchId) => String(batchId)))];
+  const existingBatches = await Batch.find({
+    _id: { $in: uniqueBatchIds },
+    isActive: true,
+    isDeleted: false,
+  }).select('_id');
+
+  if (existingBatches.length !== uniqueBatchIds.length) {
+    return 'One or more selected batches are invalid or inactive';
   }
 
   return null;
@@ -56,7 +82,12 @@ exports.getDashboard = async (req, res, next) => {
     }
 
     const totalStudents = await User.countDocuments({ role: 'student' });
-    const activeStudents = await User.countDocuments({ role: 'student', status: 'active' });
+    const activeStudents = await User.countDocuments({
+      role: 'student',
+      status: 'active',
+      approvalStatus: 'approved',
+      batchBlocked: { $ne: true },
+    });
     const blockedStudents = await User.countDocuments({ role: 'student', status: 'blocked' });
     const totalInstructors = await User.countDocuments({ role: 'instructor' });
     const totalCourses = await Course.countDocuments();
@@ -219,7 +250,9 @@ exports.getStudents = async (req, res, next) => {
 // @access  Private/Admin
 exports.getStudent = async (req, res, next) => {
   try {
-    const student = await User.findById(req.params.id).select('-password');
+    const student = await User.findById(req.params.id)
+      .select('-password')
+      .populate('approvalHistory.changedBy', 'name email role');
 
     if (!student || student.role !== 'student') {
       return res.status(404).json({
@@ -269,6 +302,13 @@ exports.updateStudentStatus = async (req, res, next) => {
 
     student.status = status;
     await student.save();
+    await logAdminAction({
+      action: 'student.status.updated',
+      actorId: req.user.id,
+      entityType: 'student',
+      entityId: student._id,
+      metadata: { status },
+    });
 
     res.status(200).json({
       success: true,
@@ -287,21 +327,11 @@ exports.createCourse = async (req, res, next) => {
     const { batches, courseInstructors, instructorId, ...courseData } = req.body;
 
     // Validate batches
-    if (!batches || !Array.isArray(batches) || batches.length === 0) {
+    const batchValidationError = await validateCourseBatches(batches);
+    if (batchValidationError) {
       return res.status(400).json({
         success: false,
-        error: 'At least one batch must be assigned',
-      });
-    }
-
-    // Verify all batches exist
-    const Batch = require('../models/Batch');
-    const existingBatches = await Batch.find({ _id: { $in: batches } });
-
-    if (existingBatches.length !== batches.length) {
-      return res.status(400).json({
-        success: false,
-        error: 'One or more batches do not exist',
+        error: batchValidationError,
       });
     }
 
@@ -349,6 +379,16 @@ exports.createCourse = async (req, res, next) => {
 exports.updateCourse = async (req, res, next) => {
   try {
     const { courseInstructors, instructorId, ...updateData } = req.body;
+    if (updateData.batches !== undefined) {
+      const batchValidationError = await validateCourseBatches(updateData.batches);
+      if (batchValidationError) {
+        return res.status(400).json({
+          success: false,
+          error: batchValidationError,
+        });
+      }
+    }
+
     const course = await Course.findById(req.params.id);
 
     if (!course) {
@@ -437,10 +477,30 @@ exports.deleteCourse = async (req, res, next) => {
 // @access  Private/Admin
 exports.getCourses = async (req, res, next) => {
   try {
-    const courses = await Course.find()
+    const { page = 1, limit = 20, search, visibility, batchId } = req.query;
+    const query = {};
+    if (visibility) {
+      query.visibility = visibility;
+    }
+    if (batchId) {
+      query.batches = batchId;
+    }
+    if (search) {
+      query.$or = [
+        { title: { $regex: search, $options: 'i' } },
+        { description: { $regex: search, $options: 'i' } },
+      ];
+    }
+
+    const total = await Course.countDocuments(query);
+    const { page: pageNum, limit: pageLimit, skip } = PaginationHelper.getPaginationParams(page, limit);
+
+    const courses = await Course.find(query)
       .populate('instructorId', 'name email')
       .populate('batches', 'name isActive')
-      .sort({ createdAt: -1 });
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(pageLimit);
 
     const assignmentsMap = await getCourseAssignmentsMap(courses.map((course) => course._id));
 
@@ -466,6 +526,7 @@ exports.getCourses = async (req, res, next) => {
       success: true,
       data: responseCourses,
       count: responseCourses.length,
+      pagination: PaginationHelper.getPaginationMeta(total, pageNum, pageLimit),
     });
   } catch (error) {
     next(error);
@@ -560,9 +621,52 @@ exports.getCourseAnalytics = async (req, res, next) => {
 // @desc    Create announcement
 // @route   POST /api/admin/announcements
 // @access  Private/Admin
+const scheduleAnnouncementDispatch = (announcementId, scheduledAt) => {
+  const delayMs = Math.max(0, new Date(scheduledAt).getTime() - Date.now());
+  const boundedDelay = Math.min(delayMs, 24 * 60 * 60 * 1000);
+  setTimeout(async () => {
+    try {
+      const announcement = await Announcement.findById(announcementId).lean();
+      if (!announcement || announcement.isDeleted) return;
+      if (announcement.expiresAt && new Date(announcement.expiresAt) <= new Date()) {
+        return;
+      }
+
+      let targetStudents = [];
+      if (announcement.targetType === 'global') {
+        targetStudents = await User.find({
+          role: 'student',
+          status: 'active',
+          approvalStatus: 'approved',
+        }).select('_id email name mobile batchId');
+      } else {
+        targetStudents = await User.find({
+          role: 'student',
+          status: 'active',
+          approvalStatus: 'approved',
+          batchId: { $in: announcement.batchIds || [] },
+        }).select('_id email name mobile batchId');
+      }
+
+      await Announcement.findByIdAndUpdate(announcement._id, {
+        $set: {
+          deliveryState: 'sent',
+          'deliveryStats.totalTargets': targetStudents.length,
+        },
+      });
+      await handleAnnouncementDelivery(announcement, targetStudents, announcement.deliveryChannels || []);
+    } catch (error) {
+      await Announcement.findByIdAndUpdate(announcementId, {
+        $set: { deliveryState: 'failed' },
+      });
+      logger.error('Scheduled announcement dispatch failed', { announcementId, error: error.message });
+    }
+  }, boundedDelay);
+};
+
 exports.createAnnouncement = async (req, res, next) => {
   try {
-    const { title, message, targetType, batchIds, deliveryChannels } = req.body;
+    const { title, message, targetType, batchIds, deliveryChannels, scheduledAt, expiresAt } = req.body;
 
     // Validation
     if (!deliveryChannels || deliveryChannels.length === 0) {
@@ -579,10 +683,40 @@ exports.createAnnouncement = async (req, res, next) => {
       });
     }
 
+    if (targetType === 'batch') {
+      const uniqueBatchIds = [...new Set(batchIds.map((batchId) => String(batchId)))];
+      const batchCount = await Batch.countDocuments({
+        _id: { $in: uniqueBatchIds },
+        isActive: true,
+        isDeleted: false,
+      });
+      if (batchCount !== uniqueBatchIds.length) {
+        return res.status(400).json({
+          success: false,
+          error: 'One or more selected batches are invalid or inactive',
+        });
+      }
+    }
+
     if (targetType === 'global' && batchIds && batchIds.length > 0) {
       return res.status(400).json({
         success: false,
         error: 'Batch IDs must be empty for global announcements',
+      });
+    }
+
+    const scheduledDate = scheduledAt ? new Date(scheduledAt) : null;
+    const expiresDate = expiresAt ? new Date(expiresAt) : null;
+    if (scheduledDate && Number.isNaN(scheduledDate.getTime())) {
+      return res.status(400).json({ success: false, error: 'Invalid scheduledAt date' });
+    }
+    if (expiresDate && Number.isNaN(expiresDate.getTime())) {
+      return res.status(400).json({ success: false, error: 'Invalid expiresAt date' });
+    }
+    if (scheduledDate && expiresDate && expiresDate <= scheduledDate) {
+      return res.status(400).json({
+        success: false,
+        error: 'expiresAt must be later than scheduledAt',
       });
     }
 
@@ -593,9 +727,23 @@ exports.createAnnouncement = async (req, res, next) => {
       targetType,
       batchIds: targetType === 'batch' ? batchIds : [],
       deliveryChannels,
+      scheduledAt: scheduledDate,
+      expiresAt: expiresDate,
+      deliveryState: scheduledDate && scheduledDate > new Date() ? 'scheduled' : 'sent',
       createdBy: req.user.id,
       deliveryStats: {
         totalTargets: 0,
+      },
+    });
+    await logAdminAction({
+      action: 'announcement.created',
+      actorId: req.user.id,
+      entityType: 'announcement',
+      entityId: announcement._id,
+      metadata: {
+        targetType,
+        deliveryChannels,
+        batchIds: targetType === 'batch' ? batchIds : [],
       },
     });
 
@@ -621,17 +769,21 @@ exports.createAnnouncement = async (req, res, next) => {
 
     logger.info(`Announcement targeting ${targetStudents.length} students`);
 
-    await Announcement.findByIdAndUpdate(announcement._id, {
-      $set: {
-        'deliveryStats.totalTargets': targetStudents.length,
-      },
-    });
+    if (scheduledDate && scheduledDate > new Date()) {
+      scheduleAnnouncementDispatch(announcement._id, scheduledDate);
+    } else {
+      await Announcement.findByIdAndUpdate(announcement._id, {
+        $set: {
+          'deliveryStats.totalTargets': targetStudents.length,
+        },
+      });
 
-    // Process delivery channels asynchronously (non-blocking)
-    // Do NOT await these - return success immediately after DB save
-    handleAnnouncementDelivery(announcement, targetStudents, deliveryChannels).catch(
-      error => logger.error('Error in announcement delivery:', error)
-    );
+      // Process delivery channels asynchronously (non-blocking)
+      // Do NOT await these - return success immediately after DB save
+      handleAnnouncementDelivery(announcement, targetStudents, deliveryChannels).catch(
+        error => logger.error('Error in announcement delivery:', error)
+      );
+    }
 
     // Populate references for response
     const populatedAnnouncement = await Announcement.findById(announcement._id)
@@ -641,7 +793,9 @@ exports.createAnnouncement = async (req, res, next) => {
     res.status(201).json({
       success: true,
       data: populatedAnnouncement,
-      message: 'Announcement created successfully. Notifications are being sent.',
+      message: scheduledDate && scheduledDate > new Date()
+        ? 'Announcement scheduled successfully.'
+        : 'Announcement created successfully. Notifications are being sent.',
     });
   } catch (error) {
     next(error);
@@ -653,47 +807,51 @@ exports.createAnnouncement = async (req, res, next) => {
  * This runs in the background without blocking the HTTP response
  */
 async function handleAnnouncementDelivery(announcement, targetStudents, deliveryChannels) {
-  // Process all channels in parallel
-  const deliveryPromises = [];
+  const channelHandlers = {
+    portal: () => handlePortalDelivery(announcement, targetStudents),
+    email: () => handleEmailDelivery(announcement, targetStudents),
+    whatsapp: () => handleWhatsAppDelivery(announcement, targetStudents),
+  };
 
-  if (deliveryChannels.includes('portal')) {
-    deliveryPromises.push(
-      handlePortalDelivery(announcement, targetStudents)
-    );
-  }
+  const selectedChannels = deliveryChannels.filter((channel) => channelHandlers[channel]);
+  const results = await Promise.all(
+    selectedChannels.map(async (channel) => {
+      try {
+        const result = await channelHandlers[channel]();
+        return { channel, ok: true, result };
+      } catch (error) {
+        return { channel, ok: false, error };
+      }
+    })
+  );
 
-  if (deliveryChannels.includes('email')) {
-    deliveryPromises.push(
-      handleEmailDelivery(announcement, targetStudents)
-    );
-  }
-
-  if (deliveryChannels.includes('whatsapp')) {
-    deliveryPromises.push(
-      handleWhatsAppDelivery(announcement, targetStudents)
-    );
-  }
-
-  // Execute all channels in parallel for scalability
-  const results = await Promise.allSettled(deliveryPromises);
   const deliveryStats = {
-    portal: { sent: 0, failed: 0 },
-    email: { sent: 0, failed: 0 },
-    whatsapp: { sent: 0, failed: 0 },
+    portal: { sent: 0, failed: 0, skipped_opt_out: 0, skipped_no_contact: 0 },
+    email: { sent: 0, failed: 0, skipped_opt_out: 0, skipped_no_contact: 0 },
+    whatsapp: { sent: 0, failed: 0, skipped_opt_out: 0, skipped_no_contact: 0 },
     totalTargets: targetStudents.length,
     updatedAt: new Date(),
   };
 
-  results.forEach((result, index) => {
-    const channel = deliveryChannels[index];
-    if (result.status === 'rejected') {
-      logger.error(`Failed to deliver via ${channel}:`, result.reason);
-      deliveryStats[channel] = { sent: 0, failed: targetStudents.length };
-    } else {
-      logger.info(`Successfully handled ${channel} delivery:`, result.value);
+  results.forEach((entry) => {
+    const { channel } = entry;
+    if (!channel) return;
+
+    if (!entry.ok) {
+      logger.error(`Failed to deliver via ${channel}:`, entry.error);
       deliveryStats[channel] = {
-        sent: result.value.sent || 0,
-        failed: result.value.failed || 0,
+        sent: 0,
+        failed: targetStudents.length,
+        skipped_opt_out: 0,
+        skipped_no_contact: 0,
+      };
+    } else {
+      logger.info(`Successfully handled ${channel} delivery:`, entry.result);
+      deliveryStats[channel] = {
+        sent: entry.result.sent || 0,
+        failed: entry.result.failed || 0,
+        skipped_opt_out: entry.result.skipped_opt_out || 0,
+        skipped_no_contact: entry.result.skipped_no_contact || 0,
       };
     }
   });
@@ -711,7 +869,7 @@ async function handleAnnouncementDelivery(announcement, targetStudents, delivery
  */
 async function handlePortalDelivery(announcement, targetStudents) {
   if (targetStudents.length === 0) {
-    return { channel: 'portal', sent: 0 };
+    return { channel: 'portal', sent: 0, failed: 0, skipped_opt_out: 0, skipped_no_contact: 0 };
   }
 
   const preferences = await NotificationPreference.find({
@@ -720,8 +878,9 @@ async function handlePortalDelivery(announcement, targetStudents) {
   }).select('userId').lean();
   const optOutIds = new Set(preferences.map((item) => item.userId.toString()));
   const eligibleStudents = targetStudents.filter((student) => !optOutIds.has(student._id.toString()));
+  const skippedOptOut = targetStudents.length - eligibleStudents.length;
   if (eligibleStudents.length === 0) {
-    return { channel: 'portal', sent: 0, failed: 0 };
+    return { channel: 'portal', sent: 0, failed: 0, skipped_opt_out: skippedOptOut, skipped_no_contact: 0 };
   }
 
   const notifications = eligibleStudents.map(student => ({
@@ -738,16 +897,69 @@ async function handlePortalDelivery(announcement, targetStudents) {
   await Notification.insertMany(notifications);
   logger.info(`Portal: Created ${notifications.length} notifications`);
 
-  return { channel: 'portal', sent: notifications.length, failed: 0 };
+  return {
+    channel: 'portal',
+    sent: notifications.length,
+    failed: 0,
+    skipped_opt_out: skippedOptOut,
+    skipped_no_contact: 0,
+  };
 }
 
 /**
  * Send emails asynchronously for scalability
  * Uses Promise.all for parallel email sending
  */
+const EMAIL_CONCURRENCY = 5;
+const EMAIL_MAX_RETRIES = 2;
+
+const sendEmailWithRetry = async (student, announcement) => {
+  let attempt = 0;
+  while (attempt <= EMAIL_MAX_RETRIES) {
+    try {
+      await sendEmail({
+        email: student.email,
+        subject: `New Announcement: ${announcement.title}`,
+        html: `
+        <h2>${announcement.title}</h2>
+        <p>Dear ${student.name},</p>
+        <p>${announcement.message}</p>
+        <p>Regards,<br>LMS Administration</p>
+      `,
+        message: announcement.message,
+      });
+      return true;
+    } catch (error) {
+      attempt += 1;
+      if (attempt > EMAIL_MAX_RETRIES) {
+        logger.warn(`Failed to send email to ${student.email}:`, error.message);
+        return false;
+      }
+    }
+  }
+  return false;
+};
+
+const processInBatches = async (items, worker, concurrency = 5) => {
+  if (!items.length) return [];
+  const results = new Array(items.length);
+  let cursor = 0;
+
+  const runners = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+    while (cursor < items.length) {
+      const index = cursor;
+      cursor += 1;
+      results[index] = await worker(items[index], index);
+    }
+  });
+
+  await Promise.all(runners);
+  return results;
+};
+
 async function handleEmailDelivery(announcement, targetStudents) {
   if (targetStudents.length === 0) {
-    return { channel: 'email', sent: 0, failed: 0 };
+    return { channel: 'email', sent: 0, failed: 0, skipped_opt_out: 0, skipped_no_contact: 0 };
   }
 
   const preferences = await NotificationPreference.find({
@@ -755,35 +967,38 @@ async function handleEmailDelivery(announcement, targetStudents) {
     'channels.email': false,
   }).select('userId').lean();
   const optOutIds = new Set(preferences.map((item) => item.userId.toString()));
-  const eligibleStudents = targetStudents.filter((student) => !optOutIds.has(student._id.toString()));
-  if (eligibleStudents.length === 0) {
-    return { channel: 'email', sent: 0, failed: 0 };
+  const optedInStudents = targetStudents.filter((student) => !optOutIds.has(student._id.toString()));
+  const contactableStudents = optedInStudents.filter((student) => student.email);
+  const skippedOptOut = targetStudents.length - optedInStudents.length;
+  const skippedNoContact = optedInStudents.length - contactableStudents.length;
+
+  if (contactableStudents.length === 0) {
+    return {
+      channel: 'email',
+      sent: 0,
+      failed: 0,
+      skipped_opt_out: skippedOptOut,
+      skipped_no_contact: skippedNoContact,
+    };
   }
 
-  const emailPromises = eligibleStudents.map(student =>
-    sendEmail({
-      email: student.email,
-      subject: `New Announcement: ${announcement.title}`,
-      html: `
-        <h2>${announcement.title}</h2>
-        <p>Dear ${student.name},</p>
-        <p>${announcement.message}</p>
-        <p>Regards,<br>LMS Administration</p>
-      `,
-      message: announcement.message,
-    }).catch(error => {
-      logger.warn(`Failed to send email to ${student.email}:`, error.message);
-      return null;
-    })
+  const emailResults = await processInBatches(
+    contactableStudents,
+    (student) => sendEmailWithRetry(student, announcement),
+    EMAIL_CONCURRENCY
   );
-
-  const results = await Promise.all(emailPromises);
-  const successCount = results.filter(r => r !== null).length;
-  const failureCount = results.filter(r => r === null).length;
+  const successCount = emailResults.filter(Boolean).length;
+  const failureCount = emailResults.length - successCount;
 
   logger.info(`Email: Sent to ${successCount}, Failed: ${failureCount}`);
 
-  return { channel: 'email', sent: successCount, failed: failureCount };
+  return {
+    channel: 'email',
+    sent: successCount,
+    failed: failureCount,
+    skipped_opt_out: skippedOptOut,
+    skipped_no_contact: skippedNoContact,
+  };
 }
 
 /**
@@ -792,7 +1007,7 @@ async function handleEmailDelivery(announcement, targetStudents) {
  */
 async function handleWhatsAppDelivery(announcement, targetStudents) {
   if (targetStudents.length === 0) {
-    return { channel: 'whatsapp', sent: 0, failed: 0 };
+    return { channel: 'whatsapp', sent: 0, failed: 0, skipped_opt_out: 0, skipped_no_contact: 0 };
   }
 
   // Filter students with mobile numbers
@@ -801,11 +1016,20 @@ async function handleWhatsAppDelivery(announcement, targetStudents) {
     'channels.whatsapp': true,
   }).select('userId').lean();
   const optedInIds = new Set(preferences.map((item) => item.userId.toString()));
-  const studentsWithPhone = targetStudents.filter(s => s.mobile && optedInIds.has(s._id.toString()));
+  const optedInStudents = targetStudents.filter((student) => optedInIds.has(student._id.toString()));
+  const studentsWithPhone = optedInStudents.filter((student) => student.mobile);
+  const skippedOptOut = targetStudents.length - optedInStudents.length;
+  const skippedNoContact = optedInStudents.length - studentsWithPhone.length;
 
   if (studentsWithPhone.length === 0) {
     logger.info('WhatsApp: No students with phone numbers');
-    return { channel: 'whatsapp', sent: 0, failed: 0 };
+    return {
+      channel: 'whatsapp',
+      sent: 0,
+      failed: 0,
+      skipped_opt_out: skippedOptOut,
+      skipped_no_contact: skippedNoContact,
+    };
   }
 
   const messages = studentsWithPhone.map(student => ({
@@ -818,7 +1042,13 @@ async function handleWhatsAppDelivery(announcement, targetStudents) {
 
   logger.info(`WhatsApp: Sent to ${result.successful}, Failed: ${result.failed}`);
 
-  return { channel: 'whatsapp', sent: result.successful, failed: result.failed };
+  return {
+    channel: 'whatsapp',
+    sent: result.successful,
+    failed: result.failed,
+    skipped_opt_out: skippedOptOut,
+    skipped_no_contact: skippedNoContact,
+  };
 }
 
 // @desc    Get all announcements
@@ -827,7 +1057,7 @@ async function handleWhatsAppDelivery(announcement, targetStudents) {
 exports.getAnnouncements = async (req, res, next) => {
   try {
     const { page = 1, limit = 10, search } = req.query;
-    const skip = (page - 1) * limit;
+    const { page: pageNum, limit: pageLimit, skip } = PaginationHelper.getPaginationParams(page, limit);
 
     const query = {};
     if (search) {
@@ -842,19 +1072,14 @@ exports.getAnnouncements = async (req, res, next) => {
       .populate('batchIds', 'name')
       .sort({ createdAt: -1 })
       .skip(skip)
-      .limit(parseInt(limit));
+      .limit(pageLimit);
 
     const total = await Announcement.countDocuments(query);
 
     res.status(200).json({
       success: true,
       data: announcements,
-      pagination: {
-        current: parseInt(page),
-        limit: parseInt(limit),
-        total,
-        pages: Math.ceil(total / limit),
-      },
+      pagination: PaginationHelper.getPaginationMeta(total, pageNum, pageLimit),
     });
   } catch (error) {
     next(error);
@@ -989,13 +1214,84 @@ exports.deleteAnnouncement = async (req, res, next) => {
 // @access  Private/Admin
 exports.getInstructors = async (req, res, next) => {
   try {
-    const instructors = await User.find({ role: 'instructor' })
+    const { page = 1, limit = 20, search, status } = req.query;
+    const query = { role: 'instructor' };
+    if (status) {
+      query.status = status;
+    }
+    if (search) {
+      query.$or = [
+        { name: { $regex: search, $options: 'i' } },
+        { email: { $regex: search, $options: 'i' } },
+      ];
+    }
+
+    const total = await User.countDocuments(query);
+    const { page: pageNum, limit: pageLimit, skip } = PaginationHelper.getPaginationParams(page, limit);
+
+    const instructors = await User.find(query)
       .select('-password')
-      .sort({ createdAt: -1 });
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(pageLimit);
+
+    const instructorIds = instructors.map((instructor) => instructor._id);
+    const assignmentCounts = await CourseInstructor.aggregate([
+      { $match: { instructor_id: { $in: instructorIds } } },
+      { $group: { _id: '$instructor_id', count: { $sum: 1 } } },
+    ]);
+    const assignmentMap = new Map(assignmentCounts.map((row) => [String(row._id), row.count]));
+
+    const data = instructors.map((instructor) => ({
+      ...instructor.toObject(),
+      assignedCoursesCount: assignmentMap.get(String(instructor._id)) || 0,
+    }));
 
     res.status(200).json({
       success: true,
-      data: instructors,
+      data,
+      pagination: PaginationHelper.getPaginationMeta(total, pageNum, pageLimit),
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Update instructor status
+// @route   PUT /api/admin/instructors/:id/status
+// @access  Private/Admin
+exports.updateInstructorStatus = async (req, res, next) => {
+  try {
+    const { status } = req.body;
+    if (!['active', 'blocked'].includes(status)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid status',
+      });
+    }
+
+    const instructor = await User.findById(req.params.id);
+    if (!instructor || instructor.role !== 'instructor') {
+      return res.status(404).json({
+        success: false,
+        error: 'Instructor not found',
+      });
+    }
+
+    instructor.status = status;
+    await instructor.save();
+    await logAdminAction({
+      action: 'instructor.status.updated',
+      actorId: req.user.id,
+      entityType: 'instructor',
+      entityId: instructor._id,
+      metadata: { status },
+    });
+
+    return res.status(200).json({
+      success: true,
+      data: instructor,
+      message: `Instructor ${status === 'active' ? 'activated' : 'blocked'} successfully`,
     });
   } catch (error) {
     next(error);
@@ -1030,6 +1326,7 @@ exports.getPendingStudents = async (req, res, next) => {
 // @access  Private/Admin
 exports.approveStudent = async (req, res, next) => {
   try {
+    const { reason } = req.body || {};
     const student = await User.findById(req.params.id);
 
     if (!student || student.role !== 'student') {
@@ -1046,8 +1343,14 @@ exports.approveStudent = async (req, res, next) => {
       });
     }
 
-    student.approvalStatus = 'approved';
-    await student.save();
+    await student.approveUser(req.user.id, reason);
+    await logAdminAction({
+      action: 'student.approved',
+      actorId: req.user.id,
+      entityType: 'student',
+      entityId: student._id,
+      metadata: { reason: reason || '' },
+    });
 
     res.status(200).json({
       success: true,
@@ -1082,8 +1385,14 @@ exports.rejectStudent = async (req, res, next) => {
       });
     }
 
-    student.approvalStatus = 'rejected';
-    await student.save();
+    await student.rejectUser(reason, req.user.id);
+    await logAdminAction({
+      action: 'student.rejected',
+      actorId: req.user.id,
+      entityType: 'student',
+      entityId: student._id,
+      metadata: { reason: reason || '' },
+    });
 
     res.status(200).json({
       success: true,
@@ -1100,7 +1409,8 @@ exports.rejectStudent = async (req, res, next) => {
 // @access  Private/Admin
 exports.updateAcademicInfo = async (req, res, next) => {
   try {
-    const { batchId, batch: term } = req.body;
+    const { batchId, batch, term } = req.body;
+    const normalizedTerm = term || batch;
     const studentId = req.params.id;
 
     // Find student
@@ -1114,14 +1424,14 @@ exports.updateAcademicInfo = async (req, res, next) => {
     }
 
     // Update batch term if provided
-    if (term) {
-      if (!['longTerm', 'shortTerm'].includes(term)) {
+    if (normalizedTerm) {
+      if (!['longTerm', 'shortTerm'].includes(normalizedTerm)) {
         return res.status(400).json({
           success: false,
           error: 'Invalid batch term. Must be longTerm or shortTerm',
         });
       }
-      student.batch = term;
+      student.batch = normalizedTerm;
     }
 
     // Update batchId if provided
@@ -1141,6 +1451,13 @@ exports.updateAcademicInfo = async (req, res, next) => {
     }
 
     await student.save();
+    await logAdminAction({
+      action: 'student.academic.updated',
+      actorId: req.user.id,
+      entityType: 'student',
+      entityId: student._id,
+      metadata: { batchId: student.batchId, term: student.batch },
+    });
 
     // Populate batch info
     await student.populate('batchId', 'name isActive');
@@ -1149,6 +1466,136 @@ exports.updateAcademicInfo = async (req, res, next) => {
       success: true,
       message: 'Student academic information updated successfully',
       data: student,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Bulk update student accounts
+// @route   POST /api/admin/students/bulk-actions
+// @access  Private/Admin
+exports.bulkUpdateStudents = async (req, res, next) => {
+  try {
+    const { studentIds = [], action, reason = '' } = req.body;
+    if (!Array.isArray(studentIds) || studentIds.length === 0) {
+      return res.status(400).json({ success: false, error: 'studentIds is required' });
+    }
+    if (!['approve', 'reject', 'block', 'unblock'].includes(action)) {
+      return res.status(400).json({ success: false, error: 'Invalid action' });
+    }
+
+    const students = await User.find({
+      _id: { $in: studentIds },
+      role: 'student',
+    });
+
+    let updatedCount = 0;
+    for (const student of students) {
+      if (action === 'approve' && student.approvalStatus !== 'approved') {
+        await student.approveUser(req.user.id, reason);
+        updatedCount += 1;
+      } else if (action === 'reject' && student.approvalStatus !== 'rejected') {
+        await student.rejectUser(reason, req.user.id);
+        updatedCount += 1;
+      } else if (action === 'block' && student.status !== 'blocked') {
+        student.status = 'blocked';
+        await student.save();
+        updatedCount += 1;
+      } else if (action === 'unblock' && student.status !== 'active') {
+        student.status = 'active';
+        await student.save();
+        updatedCount += 1;
+      }
+    }
+
+    await logAdminAction({
+      action: `student.bulk.${action}`,
+      actorId: req.user.id,
+      entityType: 'student',
+      entityId: 'bulk',
+      metadata: { studentCount: studentIds.length, updatedCount, reason },
+    });
+
+    return res.status(200).json({
+      success: true,
+      data: { updatedCount },
+      message: 'Bulk action completed',
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Export students as CSV
+// @route   GET /api/admin/students/export
+// @access  Private/Admin
+exports.exportStudentsCsv = async (req, res, next) => {
+  try {
+    const { status, approvalStatus, batchId } = req.query;
+    const query = { role: 'student' };
+    if (status) query.status = status;
+    if (approvalStatus) query.approvalStatus = approvalStatus;
+    if (batchId) query.batchId = batchId;
+
+    const students = await User.find(query)
+      .select('name email status approvalStatus batch batchId createdAt')
+      .populate('batchId', 'name')
+      .sort({ createdAt: -1 })
+      .lean();
+
+    const header = ['name', 'email', 'status', 'approvalStatus', 'term', 'batchName', 'createdAt'];
+    const rows = students.map((student) => [
+      student.name || '',
+      student.email || '',
+      student.status || '',
+      student.approvalStatus || '',
+      student.batch || '',
+      student.batchId?.name || '',
+      student.createdAt ? new Date(student.createdAt).toISOString() : '',
+    ]);
+    const csv = [header, ...rows]
+      .map((row) => row.map((cell) => `"${String(cell).replace(/"/g, '""')}"`).join(','))
+      .join('\n');
+
+    await logAdminAction({
+      action: 'student.export.csv',
+      actorId: req.user.id,
+      entityType: 'student',
+      entityId: 'export',
+      metadata: { rowCount: students.length },
+    });
+
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', 'attachment; filename="students-export.csv"');
+    return res.status(200).send(csv);
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Get admin audit logs
+// @route   GET /api/admin/audit-logs
+// @access  Private/Admin
+exports.getAuditLogs = async (req, res, next) => {
+  try {
+    const { action, page = 1, limit = 20 } = req.query;
+    const query = {};
+    if (action) query.action = action;
+
+    const total = await AdminAuditLog.countDocuments(query);
+    const { page: pageNum, limit: pageLimit, skip } = PaginationHelper.getPaginationParams(page, limit);
+    const logs = await AdminAuditLog.find(query)
+      .populate('actorId', 'name email')
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(pageLimit)
+      .lean();
+
+    return res.status(200).json({
+      success: true,
+      data: logs,
+      pagination: PaginationHelper.getPaginationMeta(total, pageNum, pageLimit),
     });
   } catch (error) {
     next(error);

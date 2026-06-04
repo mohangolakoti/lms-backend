@@ -31,6 +31,22 @@ const announcementSchema = new mongoose.Schema({
       message: 'At least one delivery channel is required',
     },
   },
+  scheduledAt: {
+    type: Date,
+    default: null,
+    index: true,
+  },
+  expiresAt: {
+    type: Date,
+    default: null,
+    index: true,
+  },
+  deliveryState: {
+    type: String,
+    enum: ['scheduled', 'sent', 'failed'],
+    default: 'sent',
+    index: true,
+  },
   isDeleted: {
     type: Boolean,
     default: false,

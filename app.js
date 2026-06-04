@@ -118,7 +118,7 @@ app.use('/api/instructors', instructorRoutes);
 app.use('/api/admin/batches', batchRoutes);
 app.use('/api/certificates', certificateRoutes);
 
-app.get('/health', (req, res) => {
+const healthHandler = (req, res) => {
   const database = getDatabaseHealth();
   const healthy = database.state === 'connected';
 
@@ -129,7 +129,10 @@ app.get('/health', (req, res) => {
     database,
     timestamp: new Date().toISOString(),
   });
-});
+};
+
+app.get('/health', healthHandler);
+app.get('/api/health', healthHandler);
 
 app.use(errorHandler);
 

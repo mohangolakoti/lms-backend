@@ -33,11 +33,14 @@ class ResponseHandler {
     
     const message = error?.message || 'Internal server error';
     const isDevelopment = process.env.NODE_ENV === 'development';
+    const stack = isDevelopment ? error?.stack : undefined;
 
     res.status(statusCode).json({
       success: false,
       message,
-      error: isDevelopment ? error?.stack : undefined,
+      error: message,
+      details: additionalData,
+      stack,
       data: additionalData,
       timestamp: new Date().toISOString(),
     });

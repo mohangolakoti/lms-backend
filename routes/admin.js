@@ -10,6 +10,9 @@ const {
   approveStudent,
   rejectStudent,
   updateAcademicInfo,
+  bulkUpdateStudents,
+  exportStudentsCsv,
+  getAuditLogs,
   createCourse,
   updateCourse,
   deleteCourse,
@@ -20,6 +23,7 @@ const {
   deleteAnnouncement,
   createInstructor,
   getInstructors,
+  updateInstructorStatus,
 } = require('../controllers/adminController');
 const { protect, authorize } = require('../middleware/auth');
 const { validate } = require('../middleware/validation');
@@ -43,6 +47,7 @@ router.use(authorize('admin'));
  */
 router.get('/dashboard', getDashboard);
 router.get('/reports/operational', getOperationalReports);
+router.get('/audit-logs', getAuditLogs);
 
 /**
  * @swagger
@@ -77,6 +82,13 @@ router.get('/reports/operational', getOperationalReports);
  *         description: List of students
  */
 router.get('/students', getStudents);
+router.get('/students/export', exportStudentsCsv);
+router.post('/students/bulk-actions', [
+  body('studentIds').isArray({ min: 1 }).withMessage('studentIds must be a non-empty array'),
+  body('studentIds.*').isMongoId().withMessage('Each studentId must be a valid Mongo ObjectId'),
+  body('action').isIn(['approve', 'reject', 'block', 'unblock']).withMessage('Invalid action'),
+  body('reason').optional().isString().withMessage('reason must be a string'),
+], validate, bulkUpdateStudents);
 
 /**
  * @swagger
@@ -279,6 +291,10 @@ router.put('/students/:id/update-academic', [
     .optional()
     .isIn(['longTerm', 'shortTerm'])
     .withMessage('Batch term must be longTerm or shortTerm'),
+  body('term')
+    .optional()
+    .isIn(['longTerm', 'shortTerm'])
+    .withMessage('Term must be longTerm or shortTerm'),
   body('batchId')
     .optional()
     .isMongoId()
@@ -467,8 +483,23 @@ router.post('/announcements', [
   body('title').notEmpty().withMessage('Title is required'),
   body('message').notEmpty().withMessage('Message is required'),
   body('targetType').isIn(['global', 'batch']).withMessage('Target type must be global or batch'),
+  body('batchIds')
+    .custom((value, { req }) => {
+      if (req.body.targetType === 'batch') {
+        if (!Array.isArray(value) || value.length === 0) {
+          throw new Error('batchIds must contain at least one batch for batch announcements');
+        }
+      }
+      if (req.body.targetType === 'global' && value && Array.isArray(value) && value.length > 0) {
+        throw new Error('batchIds must be empty for global announcements');
+      }
+      return true;
+    }),
+  body('batchIds.*').optional().isMongoId().withMessage('Each batchId must be a valid Mongo ObjectId'),
   body('deliveryChannels').isArray({ min: 1 }).withMessage('At least one delivery channel is required'),
   body('deliveryChannels.*').isIn(['email', 'whatsapp', 'portal']).withMessage('Invalid delivery channel'),
+  body('scheduledAt').optional().isISO8601().withMessage('scheduledAt must be a valid date'),
+  body('expiresAt').optional().isISO8601().withMessage('expiresAt must be a valid date'),
 ], validate, createAnnouncement);
 
 /**
@@ -536,6 +567,9 @@ router.post('/instructors', [
   body('mobile').optional().trim(),
 ], validate, createInstructor);
 router.get('/instructors', getInstructors);
+router.put('/instructors/:id/status', [
+  body('status').isIn(['active', 'blocked']).withMessage('Status must be active or blocked'),
+], validate, updateInstructorStatus);
 
 module.exports = router;
 

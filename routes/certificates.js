@@ -8,7 +8,9 @@ const {
   getTemplates,
   previewCertificate,
   generateCertificates,
+  getCertificateGenerationJobs,
   getCertificateGenerationJob,
+  revokeCertificate,
   getMyCertificates,
   getCertificatesForAdmin,
   downloadCertificate,
@@ -24,6 +26,7 @@ router.use(protect);
 router.get('/download/:certificateNumber', authorize('admin', 'student'), downloadCertificate);
 router.get('/my', authorize('student'), getMyCertificates);
 router.get('/admin', authorize('admin'), getCertificatesForAdmin);
+router.put('/admin/:certificateId/revoke', authorize('admin'), revokeCertificate);
 
 router.get('/templates', authorize('admin'), getTemplates);
 router.post(
@@ -71,6 +74,7 @@ router.post(
   generateCertificates
 );
 
+router.get('/jobs', authorize('admin'), getCertificateGenerationJobs);
 router.get('/jobs/:jobId', authorize('admin'), getCertificateGenerationJob);
 
 module.exports = router;

@@ -6,6 +6,7 @@ const {
   getBatchById,
   updateBatchStatus,
   deleteBatch,
+  restoreBatch,
   getActiveBatch,
 } = require('../controllers/batchController');
 const { protect } = require('../middleware/auth');
@@ -61,5 +62,6 @@ router.put('/:id/status', updateBatchStatus);
  * Delete a batch (only inactive batches can be deleted)
  */
 router.delete('/:id', deleteBatch);
+router.put('/:id/restore', restoreBatch);
 
 module.exports = router;

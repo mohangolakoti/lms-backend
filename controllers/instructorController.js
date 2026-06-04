@@ -4,10 +4,13 @@ const Assessment = require('../models/Assessment');
 const Submission = require('../models/Submission');
 const User = require('../models/User');
 const CourseInstructor = require('../models/CourseInstructor');
+const Batch = require('../models/Batch');
 const {
   getCourseRoleForUser,
   getCourseAssignmentsMap,
   normalizeAssignments,
+  buildPrimaryInstructorId,
+  hasAtLeastOneEditor,
   syncCourseInstructors,
 } = require('../utils/courseInstructorService');
 
@@ -74,6 +77,18 @@ const normalizeLessonOrders = (module, lessonOrder = []) => {
 
   module.lessons.sort((a, b) => a.order - b.order);
 };
+
+const ALLOWED_COURSE_UPDATE_FIELDS = new Set([
+  'title',
+  'description',
+  'term',
+  'level',
+  'thumbnailUrl',
+  'visibility',
+  'batches',
+  'courseInstructors',
+  'instructorId',
+]);
 
 // @desc    Get instructor dashboard
 // @route   GET /api/instructors/dashboard
@@ -173,7 +188,6 @@ exports.createCourse = async (req, res, next) => {
     }
 
     // Verify all batches exist
-    const Batch = require('../models/Batch');
     const existingBatches = await Batch.find({ _id: { $in: batches } });
 
     if (existingBatches.length !== batches.length) {
@@ -183,13 +197,20 @@ exports.createCourse = async (req, res, next) => {
       });
     }
 
+    const normalizedAssignments = normalizeAssignments(courseInstructors, req.user.id);
+    if (!hasAtLeastOneEditor(normalizedAssignments)) {
+      return res.status(400).json({
+        success: false,
+        error: 'At least one assigned instructor must have editor role',
+      });
+    }
+
     const course = await Course.create({
       ...courseData,
       batches,
-      instructorId: req.user.id,
+      instructorId: buildPrimaryInstructorId(normalizedAssignments, req.user.id),
     });
 
-    const normalizedAssignments = normalizeAssignments(courseInstructors, req.user.id);
     await syncCourseInstructors(course._id, normalizedAssignments);
 
     await course.populate('batches', 'name isActive');
@@ -208,6 +229,14 @@ exports.createCourse = async (req, res, next) => {
 // @access  Private/Instructor
 exports.updateCourse = async (req, res, next) => {
   try {
+    const invalidFields = Object.keys(req.body || {}).filter((field) => !ALLOWED_COURSE_UPDATE_FIELDS.has(field));
+    if (invalidFields.length > 0) {
+      return res.status(400).json({
+        success: false,
+        error: `Unsupported course update fields: ${invalidFields.join(', ')}`,
+      });
+    }
+
     const course = await Course.findById(req.params.id);
 
     if (!course) {
@@ -227,8 +256,47 @@ exports.updateCourse = async (req, res, next) => {
       return res.status(access.status).json(access.payload);
     }
 
-    Object.assign(course, req.body);
+    const { courseInstructors, instructorId, ...updateData } = req.body;
+
+    if (updateData.batches !== undefined) {
+      if (!Array.isArray(updateData.batches) || updateData.batches.length === 0) {
+        return res.status(400).json({
+          success: false,
+          error: 'At least one batch must be assigned',
+        });
+      }
+      const uniqueBatchIds = [...new Set(updateData.batches.map((id) => String(id)))];
+      const existingBatches = await Batch.find({
+        _id: { $in: uniqueBatchIds },
+        isActive: true,
+        isDeleted: false,
+      }).select('_id');
+      if (existingBatches.length !== uniqueBatchIds.length) {
+        return res.status(400).json({
+          success: false,
+          error: 'One or more selected batches are invalid or inactive',
+        });
+      }
+    }
+
+    let normalizedAssignments = null;
+    if (courseInstructors !== undefined || instructorId !== undefined) {
+      normalizedAssignments = normalizeAssignments(courseInstructors, instructorId || course.instructorId);
+      if (!hasAtLeastOneEditor(normalizedAssignments)) {
+        return res.status(400).json({
+          success: false,
+          error: 'At least one assigned instructor must have editor role',
+        });
+      }
+      updateData.instructorId = buildPrimaryInstructorId(normalizedAssignments, course.instructorId);
+    }
+
+    Object.assign(course, updateData);
     await course.save();
+
+    if (normalizedAssignments) {
+      await syncCourseInstructors(course._id, normalizedAssignments);
+    }
 
     res.status(200).json({
       success: true,

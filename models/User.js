@@ -105,6 +105,7 @@ const userSchema = new mongoose.Schema({
 // Create compound indexes
 userSchema.index({ role: 1, status: 1 });
 userSchema.index({ batchId: 1, approvalStatus: 1 });
+userSchema.index({ role: 1, approvalStatus: 1, status: 1, createdAt: -1 });
 userSchema.index({ createdAt: -1 });
 
 // Encrypt password before saving
@@ -123,7 +124,7 @@ userSchema.methods.matchPassword = async function(enteredPassword) {
 };
 
 // Approve user with audit trail
-userSchema.methods.approveUser = async function(approvedBy) {
+userSchema.methods.approveUser = async function(approvedBy, reason = '') {
   if (this.role !== 'student') {
     throw new Error('Only students can be approved');
   }
@@ -137,6 +138,7 @@ userSchema.methods.approveUser = async function(approvedBy) {
     status: 'approved',
     changedBy: approvedBy,
     changedAt: new Date(),
+    reason: reason || 'Approved by admin',
   });
 
   return this.save();

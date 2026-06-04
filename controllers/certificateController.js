@@ -7,9 +7,11 @@ const Batch = require('../models/Batch');
 const Certificate = require('../models/Certificate');
 const CertificateTemplate = require('../models/CertificateTemplate');
 const CertificateJob = require('../models/CertificateJob');
+const PaginationHelper = require('../utils/paginationHelper');
 const ResponseHandler = require('../utils/responseHandler');
 const logger = require('../utils/logger');
 const { setProcessor, enqueue } = require('../utils/certificateQueue');
+const { logAdminAction } = require('../utils/adminAudit');
 const { ValidationError, NotFoundError, ForbiddenError } = require('../utils/errors');
 const {
   defaultHtmlTemplate,
@@ -448,18 +450,63 @@ exports.generateCertificates = async (req, res, next) => {
       }, 'Using existing certificate generation job');
     }
 
-    const job = await enqueue({
-      requestedBy: req.user.id,
-      payload,
-      idempotencyKey,
-      status: 'queued',
-    });
+    let job;
+    try {
+      job = await enqueue({
+        requestedBy: req.user.id,
+        payload,
+        idempotencyKey,
+        status: 'queued',
+      });
+    } catch (error) {
+      if (error?.code === 11000) {
+        const racedJob = await CertificateJob.findOne({ idempotencyKey }).lean();
+        if (racedJob) {
+          return ResponseHandler.success(res, {
+            jobId: racedJob._id,
+            status: racedJob.status,
+            result: racedJob.result || null,
+            idempotent: true,
+          }, 'Using existing certificate generation job');
+        }
+      }
+      throw error;
+    }
 
     return ResponseHandler.success(res, {
       jobId: job._id,
       status: job.status,
       idempotent: false,
     }, 'Certificate generation queued');
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    List certificate generation jobs
+// @route   GET /api/certificates/jobs
+// @access  Private/Admin
+exports.getCertificateGenerationJobs = async (req, res, next) => {
+  try {
+    const { status, page = 1, limit = 10 } = req.query;
+    const query = {};
+    if (status) {
+      query.status = status;
+    }
+
+    const total = await CertificateJob.countDocuments(query);
+    const { page: pageNum, limit: pageLimit, skip } = PaginationHelper.getPaginationParams(page, limit);
+    const jobs = await CertificateJob.find(query)
+      .populate('requestedBy', 'name email')
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(pageLimit)
+      .lean();
+
+    return ResponseHandler.success(res, {
+      items: jobs,
+      pagination: PaginationHelper.getPaginationMeta(total, pageNum, pageLimit),
+    }, 'Certificate jobs fetched');
   } catch (error) {
     next(error);
   }
@@ -510,7 +557,7 @@ exports.getMyCertificates = async (req, res, next) => {
 // @access  Private/Admin
 exports.getCertificatesForAdmin = async (req, res, next) => {
   try {
-    const { batchId, studentId, certificateName } = req.query;
+    const { batchId, studentId, certificateName, page = 1, limit = 20 } = req.query;
     const query = {};
 
     if (batchId) query.batchId = batchId;
@@ -519,13 +566,57 @@ exports.getCertificatesForAdmin = async (req, res, next) => {
       query.certificateName = { $regex: String(certificateName).trim(), $options: 'i' };
     }
 
+    const total = await Certificate.countDocuments(query);
+    const { page: pageNum, limit: pageLimit, skip } = PaginationHelper.getPaginationParams(page, limit);
+
     const certificates = await Certificate.find(query)
       .populate('studentId', 'name email')
       .populate('batchId', 'name')
       .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(pageLimit)
       .lean();
 
-    return ResponseHandler.success(res, certificates);
+    return ResponseHandler.success(res, {
+      items: certificates,
+      pagination: PaginationHelper.getPaginationMeta(total, pageNum, pageLimit),
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Revoke certificate
+// @route   PUT /api/certificates/admin/:certificateId/revoke
+// @access  Private/Admin
+exports.revokeCertificate = async (req, res, next) => {
+  try {
+    const { certificateId } = req.params;
+    const { reason = '' } = req.body || {};
+
+    const certificate = await Certificate.findById(certificateId);
+    if (!certificate) {
+      throw new NotFoundError('Certificate');
+    }
+    if (certificate.isRevoked) {
+      throw new ValidationError('Certificate is already revoked');
+    }
+
+    certificate.isRevoked = true;
+    certificate.revokedAt = new Date();
+    certificate.revokedBy = req.user.id;
+    certificate.revocationReason = reason || 'Revoked by admin';
+    await certificate.save();
+
+    await logAdminAction({
+      action: 'certificate.revoked',
+      actorId: req.user.id,
+      entityType: 'certificate',
+      entityId: certificate._id,
+      metadata: { certificateNumber: certificate.certificateNumber, reason: certificate.revocationReason },
+    });
+
+    return ResponseHandler.success(res, certificate, 'Certificate revoked successfully');
   } catch (error) {
     next(error);
   }
@@ -582,7 +673,7 @@ exports.verifyCertificate = async (req, res, next) => {
     }
 
     return ResponseHandler.success(res, {
-      valid: true,
+      valid: !certificate.isRevoked,
       certificateNumber: certificate.certificateNumber,
       studentName: certificate.studentId?.name || 'N/A',
       certificateName: certificate.certificateName,
@@ -590,6 +681,9 @@ exports.verifyCertificate = async (req, res, next) => {
       completionDate: certificate.completionDate,
       batchName: certificate.batchId?.name || 'N/A',
       issuedAt: certificate.issuedAt,
+      revoked: certificate.isRevoked,
+      revokedAt: certificate.revokedAt,
+      revocationReason: certificate.revocationReason,
       verificationUrl: `/api/certificates/verify/${certificate.certificateNumber}`,
     });
   } catch (error) {
