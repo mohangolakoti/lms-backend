@@ -78,6 +78,166 @@ const normalizeLessonOrders = (module, lessonOrder = []) => {
   module.lessons.sort((a, b) => a.order - b.order);
 };
 
+const validateInstructorAssignments = async (assignments = []) => {
+  if (!assignments.length) {
+    return 'At least one instructor must be assigned';
+  }
+
+  if (!hasAtLeastOneEditor(assignments)) {
+    return 'At least one assigned instructor must have editor role';
+  }
+
+  const instructorIds = assignments.map((item) => item.instructorId);
+  const instructors = await User.find({
+    _id: { $in: instructorIds },
+    role: 'instructor',
+    status: 'active',
+  }).select('_id');
+
+  if (instructors.length !== assignments.length) {
+    return 'One or more assigned instructors are invalid';
+  }
+
+  return null;
+};
+
+const ALLOWED_MODULE_FIELDS = new Set(['title', 'order']);
+const ALLOWED_LESSON_FIELDS = new Set([
+  'title',
+  'description',
+  'type',
+  'url',
+  'durationSeconds',
+  'resources',
+  'order',
+]);
+
+const pickAllowedFields = (payload = {}, allowSet) => {
+  return Object.entries(payload).reduce((acc, [key, value]) => {
+    if (allowSet.has(key)) {
+      acc[key] = value;
+    }
+    return acc;
+  }, {});
+};
+
+const validateReorderIds = (existingIds = [], reorderedIds = [], label = 'items') => {
+  const existing = existingIds.map(String);
+  const incoming = reorderedIds.map(String);
+
+  if (existing.length !== incoming.length) {
+    return `${label} reorder list must include every ${label.slice(0, -1)} exactly once`;
+  }
+
+  const incomingSet = new Set(incoming);
+  if (incomingSet.size !== incoming.length) {
+    return `${label} reorder list contains duplicate IDs`;
+  }
+
+  const hasAll = existing.every((id) => incomingSet.has(id));
+  if (!hasAll) {
+    return `${label} reorder list contains invalid IDs`;
+  }
+
+  return null;
+};
+
+const normalizeSiblingOrder = (items = [], targetId, desiredOrder) => {
+  const normalizedDesiredOrder = Number.isFinite(Number(desiredOrder)) ? Number(desiredOrder) : null;
+  if (!normalizedDesiredOrder || !Array.isArray(items) || items.length === 0) {
+    return;
+  }
+
+  const sorted = [...items].sort((a, b) => a.order - b.order);
+  const targetIndex = sorted.findIndex((item) => item._id.toString() === targetId.toString());
+  if (targetIndex < 0) {
+    return;
+  }
+
+  const [target] = sorted.splice(targetIndex, 1);
+  const boundedOrder = Math.min(Math.max(normalizedDesiredOrder, 1), sorted.length + 1);
+  sorted.splice(boundedOrder - 1, 0, target);
+  sorted.forEach((item, index) => {
+    item.order = index + 1;
+  });
+};
+
+const enrichCourseWithRole = async (course, userId, userRole) => {
+  const assignmentsMap = await getCourseAssignmentsMap([course._id]);
+  const assignments = assignmentsMap.get(course._id.toString()) || [];
+  const me = assignments.find((item) => item.instructorId?._id?.toString() === userId);
+  const courseObj = course.toObject ? course.toObject() : course;
+
+  return {
+    ...courseObj,
+    instructorRole: userRole === 'admin'
+      ? 'editor'
+      : (me?.role || (course.instructorId?.toString() === userId ? 'editor' : 'viewer')),
+    courseInstructors: assignments,
+  };
+};
+
+const buildHydratedCourseProgress = async (course) => {
+  const progressData = await Progress.find({ courseId: course._id })
+    .populate('userId', 'name email batch status approvalStatus batchBlocked');
+
+  const enrolledStudents = await User.find({
+    role: 'student',
+    approvalStatus: 'approved',
+    status: 'active',
+    batchBlocked: false,
+    batchId: { $in: course.batches || [] },
+  }).select('_id name email batch status approvalStatus batchBlocked');
+
+  const progressByUserId = new Map(progressData.map((item) => [item.userId?._id?.toString(), item]));
+
+  return enrolledStudents.map((student) => {
+    const existing = progressByUserId.get(student._id.toString());
+    if (existing) {
+      return existing;
+    }
+
+    return {
+      userId: student,
+      courseId: course._id,
+      moduleProgress: [],
+      lessonProgress: [],
+      totalTimeSpent: 0,
+      overallCoursePercentage: 0,
+      lastAccessed: null,
+      completed: false,
+      completedAt: null,
+    };
+  });
+};
+
+const filterProgressRows = (rows, { status, search, batch }) => {
+  let filtered = rows;
+
+  if (status === 'completed') {
+    filtered = filtered.filter((row) => row.completed);
+  } else if (status === 'in_progress') {
+    filtered = filtered.filter((row) => !row.completed && ((row.overallCoursePercentage || 0) > 0 || row.lastAccessed));
+  } else if (status === 'not_started') {
+    filtered = filtered.filter((row) => !row.completed && !(row.overallCoursePercentage || 0) && !row.lastAccessed);
+  }
+
+  if (batch) {
+    filtered = filtered.filter((row) => row.userId?.batch === batch);
+  }
+
+  if (search) {
+    const term = search.toLowerCase();
+    filtered = filtered.filter((row) => {
+      const name = row.userId?.name?.toLowerCase() || '';
+      const email = row.userId?.email?.toLowerCase() || '';
+      return name.includes(term) || email.includes(term);
+    });
+  }
+
+  return filtered;
+};
+
 const ALLOWED_COURSE_UPDATE_FIELDS = new Set([
   'title',
   'description',
@@ -113,6 +273,25 @@ exports.getDashboard = async (req, res, next) => {
     const totalStudents = new Set(progressData.map(p => p.userId.toString())).size;
     const completedStudents = progressData.filter(p => p.completed).length;
 
+    const draftAssessments = await Assessment.countDocuments({
+      courseId: { $in: courseIds },
+      visibility: 'draft',
+    });
+
+    const instructorAssessments = await Assessment.find({ courseId: { $in: courseIds } }).select('_id');
+    const assessmentIds = instructorAssessments.map((item) => item._id);
+    const totalSubmissions = assessmentIds.length
+      ? await Submission.countDocuments({ assessmentId: { $in: assessmentIds } })
+      : 0;
+
+    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+    const atRiskStudents = progressData.filter((row) => {
+      if (row.completed) return false;
+      if ((row.overallCoursePercentage || 0) < 40) return true;
+      if (!row.lastAccessed) return true;
+      return new Date(row.lastAccessed) < sevenDaysAgo;
+    }).length;
+
     res.status(200).json({
       success: true,
       data: {
@@ -124,6 +303,11 @@ exports.getDashboard = async (req, res, next) => {
         students: {
           totalStudents,
           completedStudents,
+          atRiskStudents,
+        },
+        assessments: {
+          draftAssessments,
+          totalSubmissions,
         },
       },
     });
@@ -148,24 +332,44 @@ exports.getCourses = async (req, res, next) => {
       .populate('batches', 'name isActive')
       .sort({ createdAt: -1 });
 
-    const assignmentsMap = await getCourseAssignmentsMap(courses.map((course) => course._id));
-
-    const responseCourses = courses.map((course) => {
-      const courseObj = course.toObject();
-      const assignments = assignmentsMap.get(course._id.toString()) || [];
-      const me = assignments.find((item) => item.instructorId?._id?.toString() === req.user.id);
-
-      return {
-        ...courseObj,
-        instructorRole: me?.role || (course.instructorId?.toString() === req.user.id ? 'editor' : 'viewer'),
-        courseInstructors: assignments,
-      };
-    });
+    const responseCourses = await Promise.all(
+      courses.map((course) => enrichCourseWithRole(course, req.user.id, req.user.role))
+    );
 
     res.status(200).json({
       success: true,
       data: responseCourses,
       count: responseCourses.length,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Get single course by ID
+// @route   GET /api/instructors/courses/:id
+// @access  Private/Instructor
+exports.getCourseById = async (req, res, next) => {
+  try {
+    const course = await Course.findById(req.params.id).populate('batches', 'name isActive');
+
+    if (!course) {
+      return res.status(404).json({
+        success: false,
+        error: 'Course not found',
+      });
+    }
+
+    const access = await ensureCourseAccess({ course, req });
+    if (!access.ok) {
+      return res.status(access.status).json(access.payload);
+    }
+
+    const enriched = await enrichCourseWithRole(course, req.user.id, req.user.role);
+
+    return res.status(200).json({
+      success: true,
+      data: enriched,
     });
   } catch (error) {
     next(error);
@@ -198,10 +402,11 @@ exports.createCourse = async (req, res, next) => {
     }
 
     const normalizedAssignments = normalizeAssignments(courseInstructors, req.user.id);
-    if (!hasAtLeastOneEditor(normalizedAssignments)) {
+    const assignmentError = await validateInstructorAssignments(normalizedAssignments);
+    if (assignmentError) {
       return res.status(400).json({
         success: false,
-        error: 'At least one assigned instructor must have editor role',
+        error: assignmentError,
       });
     }
 
@@ -282,10 +487,11 @@ exports.updateCourse = async (req, res, next) => {
     let normalizedAssignments = null;
     if (courseInstructors !== undefined || instructorId !== undefined) {
       normalizedAssignments = normalizeAssignments(courseInstructors, instructorId || course.instructorId);
-      if (!hasAtLeastOneEditor(normalizedAssignments)) {
+      const assignmentError = await validateInstructorAssignments(normalizedAssignments);
+      if (assignmentError) {
         return res.status(400).json({
           success: false,
-          error: 'At least one assigned instructor must have editor role',
+          error: assignmentError,
         });
       }
       updateData.instructorId = buildPrimaryInstructorId(normalizedAssignments, course.instructorId);
@@ -329,10 +535,11 @@ exports.addModule = async (req, res, next) => {
     const maxOrder = course.modules.length > 0
       ? Math.max(...course.modules.map(m => m.order))
       : 0;
+    const modulePayload = pickAllowedFields(req.body, ALLOWED_MODULE_FIELDS);
 
     course.modules.push({
-      ...req.body,
-      order: req.body.order || maxOrder + 1,
+      ...modulePayload,
+      order: modulePayload.order || maxOrder + 1,
       lessons: [],
     });
 
@@ -374,7 +581,12 @@ exports.updateModule = async (req, res, next) => {
       });
     }
 
-    Object.assign(module, req.body);
+    const modulePayload = pickAllowedFields(req.body, ALLOWED_MODULE_FIELDS);
+    const { order, ...restModulePayload } = modulePayload;
+    Object.assign(module, restModulePayload);
+    if (order !== undefined) {
+      normalizeSiblingOrder(course.modules, module._id, order);
+    }
     await course.save();
 
     res.status(200).json({
@@ -405,7 +617,15 @@ exports.deleteModule = async (req, res, next) => {
       return res.status(access.status).json(access.payload);
     }
 
-    course.modules.id(req.params.moduleId).deleteOne();
+    const module = course.modules.id(req.params.moduleId);
+    if (!module) {
+      return res.status(404).json({
+        success: false,
+        error: 'Module not found',
+      });
+    }
+
+    module.deleteOne();
     await course.save();
 
     res.status(200).json({
@@ -447,10 +667,11 @@ exports.addLesson = async (req, res, next) => {
     const maxOrder = module.lessons.length > 0
       ? Math.max(...module.lessons.map(l => l.order))
       : 0;
+    const lessonPayload = pickAllowedFields(req.body, ALLOWED_LESSON_FIELDS);
 
     module.lessons.push({
-      ...req.body,
-      order: req.body.order || maxOrder + 1,
+      ...lessonPayload,
+      order: lessonPayload.order || maxOrder + 1,
     });
 
     await course.save();
@@ -499,7 +720,12 @@ exports.updateLesson = async (req, res, next) => {
       });
     }
 
-    Object.assign(lesson, req.body);
+    const lessonPayload = pickAllowedFields(req.body, ALLOWED_LESSON_FIELDS);
+    const { order, ...restLessonPayload } = lessonPayload;
+    Object.assign(lesson, restLessonPayload);
+    if (order !== undefined) {
+      normalizeSiblingOrder(module.lessons, lesson._id, order);
+    }
     await course.save();
 
     res.status(200).json({
@@ -538,7 +764,15 @@ exports.deleteLesson = async (req, res, next) => {
       });
     }
 
-    module.lessons.id(req.params.lessonId).deleteOne();
+    const lesson = module.lessons.id(req.params.lessonId);
+    if (!lesson) {
+      return res.status(404).json({
+        success: false,
+        error: 'Lesson not found',
+      });
+    }
+
+    lesson.deleteOne();
     await course.save();
 
     res.status(200).json({
@@ -576,6 +810,18 @@ exports.reorderModules = async (req, res, next) => {
     const access = await ensureCourseAccess({ course, req, requireEditor: true });
     if (!access.ok) {
       return res.status(access.status).json(access.payload);
+    }
+
+    const reorderValidationError = validateReorderIds(
+      course.modules.map((module) => module._id),
+      moduleOrder,
+      'modules'
+    );
+    if (reorderValidationError) {
+      return res.status(400).json({
+        success: false,
+        error: reorderValidationError,
+      });
     }
 
     normalizeModuleOrders(course, moduleOrder);
@@ -627,6 +873,18 @@ exports.reorderLessons = async (req, res, next) => {
       });
     }
 
+    const reorderValidationError = validateReorderIds(
+      module.lessons.map((lesson) => lesson._id),
+      lessonOrder,
+      'lessons'
+    );
+    if (reorderValidationError) {
+      return res.status(400).json({
+        success: false,
+        error: reorderValidationError,
+      });
+    }
+
     normalizeLessonOrders(module, lessonOrder);
     await course.save();
 
@@ -638,6 +896,16 @@ exports.reorderLessons = async (req, res, next) => {
   } catch (error) {
     next(error);
   }
+};
+
+const sanitizeAssessmentQuestions = (questions = []) => {
+  return questions.map((question) => ({
+    question: question.question,
+    type: question.type,
+    options: question.options,
+    marks: question.marks,
+    order: question.order,
+  }));
 };
 
 // @desc    Create assessment
@@ -696,11 +964,87 @@ exports.createAssessment = async (req, res, next) => {
   }
 };
 
+// @desc    Update assessment
+// @route   PUT /api/instructors/assessments/:assessmentId
+// @access  Private/Instructor
+exports.updateAssessment = async (req, res, next) => {
+  try {
+    const { assessmentId } = req.params;
+    const assessment = await Assessment.findById(assessmentId);
+
+    if (!assessment) {
+      return res.status(404).json({
+        success: false,
+        error: 'Assessment not found',
+      });
+    }
+
+    const course = await Course.findById(assessment.courseId);
+    if (!course) {
+      return res.status(404).json({
+        success: false,
+        error: 'Course not found',
+      });
+    }
+
+    const access = await ensureCourseAccess({ course, req, requireEditor: true });
+    if (!access.ok) {
+      return res.status(access.status).json(access.payload);
+    }
+
+    const allowedFields = [
+      'title',
+      'description',
+      'duration',
+      'totalMarks',
+      'passingMarks',
+      'visibility',
+      'startDate',
+      'endDate',
+      'moduleId',
+    ];
+    const updates = pickAllowedFields(req.body, new Set(allowedFields));
+
+    if (updates.moduleId) {
+      const moduleExists = course.modules.some((module) => module._id.toString() === updates.moduleId.toString());
+      if (!moduleExists) {
+        return res.status(400).json({
+          success: false,
+          error: 'moduleId must reference a module in the selected course',
+        });
+      }
+    }
+
+    if (updates.passingMarks !== undefined || updates.totalMarks !== undefined) {
+      const totalMarks = updates.totalMarks !== undefined ? Number(updates.totalMarks) : Number(assessment.totalMarks);
+      const passingMarks = updates.passingMarks !== undefined ? Number(updates.passingMarks) : Number(assessment.passingMarks);
+      if (passingMarks > totalMarks) {
+        return res.status(400).json({
+          success: false,
+          error: 'passingMarks cannot exceed totalMarks',
+        });
+      }
+    }
+
+    Object.assign(assessment, updates);
+    await assessment.save();
+
+    return res.status(200).json({
+      success: true,
+      data: assessment,
+      message: 'Assessment updated successfully',
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
 // @desc    Get assessments for instructor's courses
 // @route   GET /api/instructors/assessments
 // @access  Private/Instructor
 exports.getAssessments = async (req, res, next) => {
   try {
+    const { courseId, visibility } = req.query;
     const assignedCourseIds = await getAssignedCourseIds(req.user.id);
     const courses = await Course.find({
       $or: [
@@ -710,13 +1054,131 @@ exports.getAssessments = async (req, res, next) => {
     });
     const courseIds = courses.map(c => c._id);
 
-    const assessments = await Assessment.find({ courseId: { $in: courseIds } })
+    const query = { courseId: { $in: courseIds } };
+    if (courseId) {
+      query.courseId = courseId;
+    }
+    if (visibility && ['published', 'draft'].includes(visibility)) {
+      query.visibility = visibility;
+    }
+
+    const assessments = await Assessment.find(query)
       .populate('courseId', 'title')
       .sort({ createdAt: -1 });
 
+    const roleByCourseId = new Map(
+      (await Promise.all(courses.map((course) => enrichCourseWithRole(course, req.user.id, req.user.role))))
+        .map((course) => [course._id.toString(), course.instructorRole])
+    );
+
+    const responseAssessments = assessments.map((assessment) => ({
+      ...assessment.toObject(),
+      instructorRole: roleByCourseId.get(assessment.courseId?._id?.toString() || assessment.courseId?.toString()) || 'viewer',
+    }));
+
     res.status(200).json({
       success: true,
-      data: assessments,
+      data: responseAssessments,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Delete assessment
+// @route   DELETE /api/instructors/assessments/:assessmentId
+// @access  Private/Instructor
+exports.deleteAssessment = async (req, res, next) => {
+  try {
+    const { assessmentId } = req.params;
+    const assessment = await Assessment.findById(assessmentId);
+
+    if (!assessment) {
+      return res.status(404).json({
+        success: false,
+        error: 'Assessment not found',
+      });
+    }
+
+    const course = await Course.findById(assessment.courseId);
+    if (!course) {
+      return res.status(404).json({
+        success: false,
+        error: 'Course not found',
+      });
+    }
+
+    const access = await ensureCourseAccess({ course, req, requireEditor: true });
+    if (!access.ok) {
+      return res.status(access.status).json(access.payload);
+    }
+
+    const submissionCount = await Submission.countDocuments({ assessmentId });
+    if (submissionCount > 0) {
+      return res.status(409).json({
+        success: false,
+        error: 'Cannot delete assessment with existing submissions',
+      });
+    }
+
+    await assessment.deleteOne();
+
+    return res.status(200).json({
+      success: true,
+      message: 'Assessment deleted successfully',
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Duplicate assessment
+// @route   POST /api/instructors/assessments/:assessmentId/duplicate
+// @access  Private/Instructor
+exports.duplicateAssessment = async (req, res, next) => {
+  try {
+    const { assessmentId } = req.params;
+    const assessment = await Assessment.findById(assessmentId);
+
+    if (!assessment) {
+      return res.status(404).json({
+        success: false,
+        error: 'Assessment not found',
+      });
+    }
+
+    const course = await Course.findById(assessment.courseId);
+    if (!course) {
+      return res.status(404).json({
+        success: false,
+        error: 'Course not found',
+      });
+    }
+
+    const access = await ensureCourseAccess({ course, req, requireEditor: true });
+    if (!access.ok) {
+      return res.status(access.status).json(access.payload);
+    }
+
+    const clone = await Assessment.create({
+      courseId: assessment.courseId,
+      moduleId: assessment.moduleId,
+      title: `${assessment.title} (Copy)`,
+      description: assessment.description,
+      questions: assessment.questions,
+      duration: assessment.duration,
+      totalMarks: assessment.totalMarks,
+      passingMarks: assessment.passingMarks,
+      startDate: assessment.startDate,
+      endDate: assessment.endDate,
+      visibility: 'draft',
+      createdBy: req.user.id,
+    });
+
+    return res.status(201).json({
+      success: true,
+      data: clone,
+      message: 'Assessment duplicated successfully',
     });
   } catch (error) {
     next(error);
@@ -787,7 +1249,8 @@ exports.getAssessmentAnalytics = async (req, res, next) => {
           failCount,
           passRate: totalAttempts > 0 ? (passCount / totalAttempts) * 100 : 0,
           averageScore,
-          averageTimeTaken,
+          averageTimeTakenSeconds: averageTimeTaken,
+          averageTimeTakenMinutes: averageTimeTaken / 60,
         },
         trend: Object.entries(attemptsByDay)
           .sort((a, b) => a[0].localeCompare(b[0]))
@@ -805,6 +1268,7 @@ exports.getAssessmentAnalytics = async (req, res, next) => {
 exports.getCourseProgress = async (req, res, next) => {
   try {
     const { courseId } = req.params;
+    const { status, search, batch } = req.query;
 
     const course = await Course.findById(courseId);
     if (!course) {
@@ -819,13 +1283,66 @@ exports.getCourseProgress = async (req, res, next) => {
       return res.status(access.status).json(access.payload);
     }
 
-    const progressData = await Progress.find({ courseId })
-      .populate('userId', 'name email batch');
+    const hydratedProgress = await buildHydratedCourseProgress(course);
+    const filtered = filterProgressRows(hydratedProgress, { status, search, batch });
 
     res.status(200).json({
       success: true,
-      data: progressData,
+      data: filtered,
     });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Export student progress CSV for course
+// @route   GET /api/instructors/courses/:courseId/progress/export
+// @access  Private/Instructor
+exports.exportCourseProgressCsv = async (req, res, next) => {
+  try {
+    const { courseId } = req.params;
+    const { status, search, batch } = req.query;
+
+    const course = await Course.findById(courseId);
+    if (!course) {
+      return res.status(404).json({
+        success: false,
+        error: 'Course not found',
+      });
+    }
+
+    const access = await ensureCourseAccess({ course, req });
+    if (!access.ok) {
+      return res.status(access.status).json(access.payload);
+    }
+
+    const hydratedProgress = await buildHydratedCourseProgress(course);
+    const filtered = filterProgressRows(hydratedProgress, { status, search, batch });
+
+    const escapeCsv = (value) => {
+      const str = value == null ? '' : String(value);
+      if (/[",\n]/.test(str)) {
+        return `"${str.replace(/"/g, '""')}"`;
+      }
+      return str;
+    };
+
+    const header = ['Name', 'Email', 'Batch', 'Progress %', 'Status', 'Time Spent (min)', 'Last Accessed'];
+    const rows = filtered.map((row) => [
+      row.userId?.name || '',
+      row.userId?.email || '',
+      row.userId?.batch || '',
+      Math.round(row.overallCoursePercentage || 0),
+      row.completed ? 'Completed' : ((row.overallCoursePercentage || 0) > 0 || row.lastAccessed) ? 'In Progress' : 'Not Started',
+      Math.round((row.totalTimeSpent || 0) / 60),
+      row.lastAccessed ? new Date(row.lastAccessed).toISOString() : '',
+    ]);
+
+    const csv = [header, ...rows].map((line) => line.map(escapeCsv).join(',')).join('\n');
+
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="course-${courseId}-progress.csv"`);
+    return res.status(200).send(csv);
   } catch (error) {
     next(error);
   }
@@ -876,7 +1393,7 @@ exports.getSubmissions = async (req, res, next) => {
           duration: assessment.duration,
           totalMarks: assessment.totalMarks,
           passingMarks: assessment.passingMarks,
-          questions: assessment.questions,
+          questions: sanitizeAssessmentQuestions(assessment.questions),
         },
         submissions,
       },

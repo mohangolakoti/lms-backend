@@ -3,6 +3,7 @@ const router = express.Router();
 const {
   getDashboard,
   getCourses,
+  getCourseById,
   createCourse,
   updateCourse,
   addModule,
@@ -14,9 +15,13 @@ const {
   reorderModules,
   reorderLessons,
   createAssessment,
+  updateAssessment,
+  deleteAssessment,
+  duplicateAssessment,
   getAssessments,
   getAssessmentAnalytics,
   getCourseProgress,
+  exportCourseProgressCsv,
   getSubmissions,
   gradeSubmission,
 } = require('../controllers/instructorController');
@@ -85,6 +90,7 @@ router.get('/dashboard', getDashboard);
  *         description: Course created successfully
  */
 router.get('/courses', getCourses);
+router.get('/courses/:id', getCourseById);
 // POST courses only allowed for admin - instructors can only view and manage their assigned courses
 router.post('/courses', [
   body('title').notEmpty().withMessage('Title is required'),
@@ -190,11 +196,11 @@ router.post('/courses/:id/modules', [
  *       200:
  *         description: Module deleted successfully
  */
-router.put('/courses/:courseId/modules/:moduleId', updateModule);
-router.delete('/courses/:courseId/modules/:moduleId', deleteModule);
 router.put('/courses/:courseId/modules/reorder', [
   body('moduleOrder').isArray({ min: 1 }).withMessage('moduleOrder must be a non-empty array'),
 ], validate, reorderModules);
+router.put('/courses/:courseId/modules/:moduleId', updateModule);
+router.delete('/courses/:courseId/modules/:moduleId', deleteModule);
 
 /**
  * @swagger
@@ -301,11 +307,11 @@ router.post('/courses/:courseId/modules/:moduleId/lessons', [
  *       200:
  *         description: Lesson deleted successfully
  */
-router.put('/courses/:courseId/modules/:moduleId/lessons/:lessonId', updateLesson);
-router.delete('/courses/:courseId/modules/:moduleId/lessons/:lessonId', deleteLesson);
 router.put('/courses/:courseId/modules/:moduleId/lessons/reorder', [
   body('lessonOrder').isArray({ min: 1 }).withMessage('lessonOrder must be a non-empty array'),
 ], validate, reorderLessons);
+router.put('/courses/:courseId/modules/:moduleId/lessons/:lessonId', updateLesson);
+router.delete('/courses/:courseId/modules/:moduleId/lessons/:lessonId', deleteLesson);
 
 /**
  * @swagger
@@ -377,6 +383,18 @@ router.post('/assessments', [
     .notEmpty().withMessage('Passing marks is required')
     .isNumeric().withMessage('Passing marks must be a number'),
 ], validate, createAssessment);
+router.put('/assessments/:assessmentId', [
+  body('title').optional().trim().notEmpty().withMessage('Title cannot be empty'),
+  body('duration').optional().isNumeric().withMessage('Duration must be a number'),
+  body('totalMarks').optional().isNumeric().withMessage('Total marks must be a number'),
+  body('passingMarks').optional().isNumeric().withMessage('Passing marks must be a number'),
+  body('visibility').optional().isIn(['published', 'draft']).withMessage('Invalid visibility'),
+  body('moduleId').optional().isMongoId().withMessage('Invalid moduleId'),
+  body('startDate').optional().isISO8601().withMessage('startDate must be valid date'),
+  body('endDate').optional().isISO8601().withMessage('endDate must be valid date'),
+], validate, updateAssessment);
+router.delete('/assessments/:assessmentId', deleteAssessment);
+router.post('/assessments/:assessmentId/duplicate', duplicateAssessment);
 router.get('/assessments', getAssessments);
 router.get('/assessments/:assessmentId/analytics', getAssessmentAnalytics);
 
@@ -398,6 +416,7 @@ router.get('/assessments/:assessmentId/analytics', getAssessmentAnalytics);
  *       200:
  *         description: Student progress data
  */
+router.get('/courses/:courseId/progress/export', exportCourseProgressCsv);
 router.get('/courses/:courseId/progress', getCourseProgress);
 
 /**
