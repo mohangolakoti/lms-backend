@@ -21,6 +21,16 @@ const announcementSchema = new mongoose.Schema({
       ref: 'Batch',
     },
   ],
+  courseId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Course',
+    default: null,
+  },
+  pinned: {
+    type: Boolean,
+    default: false,
+    index: true,
+  },
   deliveryChannels: {
     type: [String],
     enum: ['email', 'whatsapp', 'portal'],

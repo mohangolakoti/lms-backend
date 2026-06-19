@@ -25,6 +25,14 @@ const lessonSchema = new mongoose.Schema({
   resources: [{
     type: String,
   }],
+  assessmentId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Assessment',
+  },
+  isPreview: {
+    type: Boolean,
+    default: false,
+  },
   order: {
     type: Number,
     required: true,

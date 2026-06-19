@@ -57,6 +57,19 @@ const progressSchema = new mongoose.Schema({
     type: Date,
     default: Date.now,
   },
+  lastAccessedLessonId: {
+    type: mongoose.Schema.Types.ObjectId,
+  },
+  lastAccessedModuleId: {
+    type: mongoose.Schema.Types.ObjectId,
+  },
+  currentStreakDays: {
+    type: Number,
+    default: 0,
+  },
+  lastActivityDate: {
+    type: Date,
+  },
   completed: {
     type: Boolean,
     default: false,

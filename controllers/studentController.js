@@ -3,9 +3,74 @@ const Progress = require('../models/Progress');
 const Assessment = require('../models/Assessment');
 const Submission = require('../models/Submission');
 const Announcement = require('../models/Announcement');
+const AnnouncementRead = require('../models/AnnouncementRead');
 const Notification = require('../models/Notification');
 const NotificationPreference = require('../models/NotificationPreference');
+const LessonBookmark = require('../models/LessonBookmark');
+const LessonNote = require('../models/LessonNote');
 const User = require('../models/User');
+const {
+  assertCourseAccess,
+  buildAssignedCoursesQuery,
+  getAssessmentWindowStatus,
+  assertAssessmentWindow,
+  sortModulesWithLessons,
+  findContinueLesson,
+} = require('../utils/studentAccess');
+const { NotFoundError, ForbiddenError } = require('../utils/errors');
+
+const buildAnnouncementFilter = (user) => {
+  const now = new Date();
+  const announcementFilter = {
+    $or: [{ targetType: 'global' }],
+    $and: [
+      {
+        $or: [
+          { deliveryState: 'sent' },
+          { scheduledAt: { $lte: now } },
+        ],
+      },
+      {
+        $or: [
+          { expiresAt: null },
+          { expiresAt: { $gt: now } },
+        ],
+      },
+    ],
+  };
+
+  if (user.batchId) {
+    announcementFilter.$or.push({
+      targetType: 'batch',
+      batchIds: user.batchId,
+    });
+  }
+
+  return announcementFilter;
+};
+
+const updateActivityStreak = (progress) => {
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+
+  if (!progress.lastActivityDate) {
+    progress.currentStreakDays = 1;
+    progress.lastActivityDate = today;
+    return;
+  }
+
+  const last = new Date(progress.lastActivityDate);
+  last.setHours(0, 0, 0, 0);
+  const diffDays = Math.round((today - last) / (1000 * 60 * 60 * 24));
+
+  if (diffDays === 0) return;
+  if (diffDays === 1) {
+    progress.currentStreakDays = (progress.currentStreakDays || 0) + 1;
+  } else {
+    progress.currentStreakDays = 1;
+  }
+  progress.lastActivityDate = today;
+};
 
 // @desc    Get student dashboard
 // @route   GET /api/students/dashboard
@@ -27,6 +92,7 @@ exports.getDashboard = async (req, res, next) => {
             totalModules: 0,
             completedModules: 0,
             totalTimeSpent: 0,
+            totalTimeSpentSeconds: 0,
             totalAssessments: 0,
             completedAssessments: 0,
             totalQuestionsAttempted: 0,
@@ -115,7 +181,8 @@ exports.getDashboard = async (req, res, next) => {
           completedCourses,
           totalModules,
           completedModules,
-          totalTimeSpent: Math.round(totalTimeSpent / 60), // Convert to minutes
+          totalTimeSpent: totalTimeSpent,
+          totalTimeSpentSeconds: totalTimeSpent,
           totalAssessments,
           completedAssessments,
           totalQuestionsAttempted,
@@ -215,7 +282,7 @@ exports.getCourseDetails = async (req, res, next) => {
     const { courseId } = req.params;
     const userId = req.user.id;
     const ResponseHandler = require('../utils/responseHandler');
-    const { NotFoundError, ForbiddenError, ValidationError } = require('../utils/errors');
+    const { NotFoundError } = require('../utils/errors');
 
     // Fetch user with batchId
     const user = await User.findById(userId).populate('batchId');
@@ -232,22 +299,7 @@ exports.getCourseDetails = async (req, res, next) => {
       throw new NotFoundError('Course');
     }
 
-    // Check batch access
-    if (!user.batchId) {
-      throw new ForbiddenError('No batch assigned. Unable to access courses.');
-    }
-
-    // Verify term match
-    const termMatch = course.term === user.batch || course.term === 'both';
-    if (!termMatch) {
-      throw new ForbiddenError('Course not available for your batch term');
-    }
-
-    // Verify batch is in course batches
-    const batchInCourse = course.batches.some(b => b._id.toString() === user.batchId._id.toString());
-    if (!batchInCourse) {
-      throw new ForbiddenError('You do not have access to this course');
-    }
+    assertCourseAccess(user, course);
 
     // Get or create progress (avoid N+1 queries)
     let progress = await Progress.findOne({ userId, courseId });
@@ -265,30 +317,36 @@ exports.getCourseDetails = async (req, res, next) => {
       });
     }
 
-    // Build modules with progress
-    const modulesWithProgress = course.modules.map(module => {
-      const moduleProg = progress.moduleProgress.find(
-        mp => mp.moduleId.toString() === module._id.toString()
-      );
-
-      const lessonsWithProgress = module.lessons.map(lesson => {
-        const lessonProg = progress.lessonProgress.find(
-          lp => lp.lessonId.toString() === lesson._id.toString()
+    const modulesWithProgress = [...course.modules]
+      .sort((a, b) => a.order - b.order)
+      .map((module) => {
+        const moduleProg = progress.moduleProgress.find(
+          (mp) => mp.moduleId.toString() === module._id.toString()
         );
 
+        const lessonsWithProgress = [...(module.lessons || [])]
+          .sort((a, b) => a.order - b.order)
+          .map((lesson) => {
+            const lessonProg = progress.lessonProgress.find(
+              (lp) => lp.lessonId.toString() === lesson._id.toString()
+            );
+            const lessonObj = lesson.toObject ? lesson.toObject() : lesson;
+
+            return {
+              ...lessonObj,
+              completed: lessonProg ? lessonProg.completed : false,
+              lastWatchedSecond: lessonProg ? lessonProg.lastWatchedSecond : 0,
+            };
+          });
+
+        const moduleObj = module.toObject ? module.toObject() : module;
+
         return {
-          ...lesson.toObject(),
-          completed: lessonProg ? lessonProg.completed : false,
-          lastWatchedSecond: lessonProg ? lessonProg.lastWatchedSecond : 0,
+          ...moduleObj,
+          lessons: lessonsWithProgress,
+          completionPercentage: moduleProg ? moduleProg.completionPercentage : 0,
         };
       });
-
-      return {
-        ...module.toObject(),
-        lessons: lessonsWithProgress,
-        completionPercentage: moduleProg ? moduleProg.completionPercentage : 0,
-      };
-    });
 
     res.status(200).json({
       success: true,
@@ -301,6 +359,9 @@ exports.getCourseDetails = async (req, res, next) => {
           overallCoursePercentage: progress.overallCoursePercentage,
           totalTimeSpent: progress.totalTimeSpent,
           completed: progress.completed,
+          lastAccessedLessonId: progress.lastAccessedLessonId,
+          lastAccessedModuleId: progress.lastAccessedModuleId,
+          currentStreakDays: progress.currentStreakDays || 0,
         },
       },
     });
@@ -324,6 +385,17 @@ exports.updateLessonProgress = async (req, res, next) => {
         success: false,
         error: 'Course not found',
       });
+    }
+
+    const user = await User.findById(userId).populate('batchId');
+    if (!user) {
+      return res.status(404).json({ success: false, error: 'User not found' });
+    }
+
+    try {
+      assertCourseAccess(user, course);
+    } catch (accessError) {
+      return res.status(403).json({ success: false, error: accessError.message });
     }
 
     // Find the lesson's module
@@ -403,7 +475,9 @@ exports.updateLessonProgress = async (req, res, next) => {
 
       progress.moduleProgress[moduleProgIndex].completedLessons = completedLessons;
       progress.moduleProgress[moduleProgIndex].completionPercentage =
-        (completedLessons.length / lessonModule.lessons.length) * 100;
+        lessonModule.lessons.length > 0
+          ? (completedLessons.length / lessonModule.lessons.length) * 100
+          : 0;
     }
 
     // Calculate overall course percentage
@@ -427,6 +501,9 @@ exports.updateLessonProgress = async (req, res, next) => {
     }
 
     progress.lastAccessed = Date.now();
+    progress.lastAccessedLessonId = lessonId;
+    progress.lastAccessedModuleId = lessonModule._id;
+    updateActivityStreak(progress);
     await progress.save();
 
     res.status(200).json({
@@ -444,17 +521,19 @@ exports.updateLessonProgress = async (req, res, next) => {
 exports.getAssessments = async (req, res, next) => {
   try {
     const userId = req.user.id;
-    const user = await User.findById(userId);
+    const { status, courseId } = req.query;
+    const user = await User.findById(userId).populate('batchId');
 
-    // Get assigned courses
-    const courses = await Course.find({
-      $or: [
-        { term: user.batch },
-        { term: 'both' },
-      ],
-      visibility: 'published',
-    });
+    const courseQuery = buildAssignedCoursesQuery(user);
+    if (!courseQuery) {
+      return res.status(200).json({ success: true, data: [] });
+    }
 
+    if (courseId) {
+      courseQuery._id = courseId;
+    }
+
+    const courses = await Course.find(courseQuery).select('_id title');
     const courseIds = courses.map(c => c._id);
 
     const assessments = await Assessment.find({
@@ -462,31 +541,42 @@ exports.getAssessments = async (req, res, next) => {
       visibility: 'published',
     })
       .populate('courseId', 'title')
-      .populate('createdBy', 'name');
+      .populate('createdBy', 'name')
+      .select('-questions.correctAnswer');
 
-    // Get submissions
     const submissions = await Submission.find({ userId });
+    const now = new Date();
 
-    const assessmentsWithStatus = assessments.map(assessment => {
+    let assessmentsWithStatus = assessments.map(assessment => {
       const submission = submissions.find(
         s => s.assessmentId.toString() === assessment._id.toString()
       );
-
-      const sanitizedQuestions = (assessment.questions || []).map(({ correctAnswer, ...question }) => question);
+      const windowStatus = getAssessmentWindowStatus(assessment, now);
 
       return {
         ...assessment.toObject(),
-        questions: sanitizedQuestions,
+        questionCount: assessment.questions?.length || 0,
+        questions: undefined,
+        windowStatus,
         submitted: !!submission,
         submission: submission ? {
           score: submission.score,
           percentage: submission.percentage,
           passed: submission.passed,
           submittedAt: submission.submittedAt,
-          answers: submission.answers,
         } : null,
       };
     });
+
+    if (status) {
+      assessmentsWithStatus = assessmentsWithStatus.filter((assessment) => {
+        if (status === 'completed') return assessment.submitted;
+        if (status === 'live') return !assessment.submitted && assessment.windowStatus === 'live';
+        if (status === 'upcoming') return !assessment.submitted && assessment.windowStatus === 'upcoming';
+        if (status === 'closed') return !assessment.submitted && assessment.windowStatus === 'closed';
+        return true;
+      });
+    }
 
     res.status(200).json({
       success: true,
@@ -524,16 +614,30 @@ exports.getAssessmentById = async (req, res, next) => {
       });
     }
 
-    const termMatch = assessment.courseId?.term === user.batch || assessment.courseId?.term === 'both';
-    const batchMatch = assessment.courseId?.batches?.some((batch) => batch.toString() === user.batchId._id.toString());
-    if (!termMatch || !batchMatch) {
-      return res.status(403).json({
-        success: false,
-        error: 'You do not have access to this assessment',
-      });
+    try {
+      assertCourseAccess(user, assessment.courseId);
+    } catch (accessError) {
+      return res.status(403).json({ success: false, error: accessError.message });
     }
 
     const submission = await Submission.findOne({ userId, assessmentId });
+    const windowStatus = getAssessmentWindowStatus(assessment);
+
+    try {
+      assertAssessmentWindow(assessment, {
+        allowViewSubmitted: true,
+        hasSubmission: !!submission,
+      });
+    } catch (windowError) {
+      if (!submission) {
+        return res.status(403).json({
+          success: false,
+          error: windowError.message,
+          windowStatus,
+        });
+      }
+    }
+
     const sanitizedQuestions = (assessment.questions || []).map(({ correctAnswer, ...question }) => question);
 
     return res.status(200).json({
@@ -541,6 +645,7 @@ exports.getAssessmentById = async (req, res, next) => {
       data: {
         ...assessment.toObject(),
         questions: sanitizedQuestions,
+        windowStatus,
         submitted: !!submission,
         submission: submission ? {
           score: submission.score,
@@ -589,20 +694,18 @@ exports.submitAssessment = async (req, res, next) => {
 
     const user = await User.findById(userId).populate('batchId');
     const course = await Course.findById(assessment.courseId).select('term batches visibility');
-    if (!user || !user.batchId || !course || course.visibility !== 'published') {
+    if (!user || !user.batchId || !course) {
       return res.status(403).json({
         success: false,
         error: 'You do not have access to this assessment',
       });
     }
 
-    const termMatch = course.term === user.batch || course.term === 'both';
-    const batchMatch = course.batches.some((batch) => batch.toString() === user.batchId._id.toString());
-    if (!termMatch || !batchMatch) {
-      return res.status(403).json({
-        success: false,
-        error: 'You do not have access to this assessment',
-      });
+    try {
+      assertCourseAccess(user, course);
+      assertAssessmentWindow(assessment);
+    } catch (accessError) {
+      return res.status(403).json({ success: false, error: accessError.message });
     }
 
     // Check if already submitted
@@ -694,23 +797,13 @@ exports.getAnnouncements = async (req, res, next) => {
       });
     }
 
-    const announcementFilter = {
-      $or: [
-        { targetType: 'global' },
-      ],
-    };
-
-    if (user.batchId) {
-      announcementFilter.$or.push({
-        targetType: 'batch',
-        batchIds: user.batchId,
-      });
-    }
+    const announcementFilter = buildAnnouncementFilter(user);
 
     const announcements = await Announcement.find(announcementFilter)
       .populate('createdBy', 'name')
       .populate('batchIds', 'name')
-      .sort({ createdAt: -1 });
+      .populate('courseId', 'title')
+      .sort({ pinned: -1, createdAt: -1 });
 
     res.status(200).json({
       success: true,
@@ -859,6 +952,318 @@ exports.updateNotificationPreferences = async (req, res, next) => {
       success: true,
       data: preferences,
       message: 'Notification preferences updated',
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Get learning path summary for dashboard
+// @route   GET /api/students/learning-path
+// @access  Private/Student
+exports.getLearningPath = async (req, res, next) => {
+  try {
+    const userId = req.user.id;
+    const user = await User.findById(userId).populate('batchId');
+
+    if (!user?.batchId) {
+      return res.status(200).json({
+        success: true,
+        data: {
+          continueLesson: null,
+          upcomingAssessments: [],
+          recentAnnouncements: [],
+          unreadNotificationCount: 0,
+        },
+      });
+    }
+
+    const courseQuery = buildAssignedCoursesQuery(user);
+    const courses = await Course.find(courseQuery).populate('instructorId', 'name email');
+    const progressData = await Progress.find({ userId });
+    const now = new Date();
+
+    let continueLesson = null;
+    const rankedCourses = courses
+      .map((course) => {
+        const progress = progressData.find((p) => p.courseId.toString() === course._id.toString());
+        return { course, progress, pct: progress?.overallCoursePercentage || 0, completed: progress?.completed };
+      })
+      .filter((row) => !row.completed)
+      .sort((a, b) => a.pct - b.pct);
+
+    for (const row of rankedCourses.slice(0, 3)) {
+      const next = findContinueLesson(row.course, row.progress);
+      if (next) {
+        continueLesson = {
+          ...next,
+          progress: row.pct,
+          instructor: row.course.instructorId?.name,
+        };
+        break;
+      }
+    }
+
+    const courseIds = courses.map((c) => c._id);
+    const assessments = await Assessment.find({
+      courseId: { $in: courseIds },
+      visibility: 'published',
+    }).populate('courseId', 'title');
+
+    const submissions = await Submission.find({ userId });
+    const submittedIds = new Set(submissions.map((s) => s.assessmentId.toString()));
+
+    const upcomingAssessments = assessments
+      .filter((a) => !submittedIds.has(a._id.toString()) && getAssessmentWindowStatus(a, now) !== 'closed')
+      .sort((a, b) => new Date(a.endDate || Infinity) - new Date(b.endDate || Infinity))
+      .slice(0, 5)
+      .map((a) => ({
+        _id: a._id,
+        title: a.title,
+        courseTitle: a.courseId?.title,
+        endDate: a.endDate,
+        windowStatus: getAssessmentWindowStatus(a, now),
+      }));
+
+    const announcements = await Announcement.find(buildAnnouncementFilter(user))
+      .populate('createdBy', 'name')
+      .populate('courseId', 'title')
+      .sort({ pinned: -1, createdAt: -1 })
+      .limit(5);
+
+    const unreadNotificationCount = await Notification.countDocuments({ userId, read: false });
+
+    res.status(200).json({
+      success: true,
+      data: {
+        continueLesson,
+        upcomingAssessments,
+        recentAnnouncements: announcements,
+        unreadNotificationCount,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Get unread notification count
+// @route   GET /api/students/notifications/unread-count
+// @access  Private/Student
+exports.getUnreadNotificationCount = async (req, res, next) => {
+  try {
+    const count = await Notification.countDocuments({ userId: req.user.id, read: false });
+    res.status(200).json({ success: true, data: { count } });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Mark announcement as read
+// @route   PUT /api/students/announcements/:announcementId/read
+// @access  Private/Student
+exports.markAnnouncementRead = async (req, res, next) => {
+  try {
+    const { announcementId } = req.params;
+    const userId = req.user.id;
+
+    const announcement = await Announcement.findById(announcementId);
+    if (!announcement) {
+      throw new NotFoundError('Announcement');
+    }
+
+    const read = await AnnouncementRead.findOneAndUpdate(
+      { userId, announcementId },
+      { readAt: new Date() },
+      { upsert: true, new: true }
+    );
+
+    res.status(200).json({ success: true, data: read });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Get course resume info
+// @route   GET /api/students/courses/:courseId/resume
+// @access  Private/Student
+exports.getCourseResume = async (req, res, next) => {
+  try {
+    const { courseId } = req.params;
+    const userId = req.user.id;
+    const user = await User.findById(userId).populate('batchId');
+    const course = await Course.findById(courseId);
+
+    if (!course) throw new NotFoundError('Course');
+    assertCourseAccess(user, course);
+
+    const progress = await Progress.findOne({ userId, courseId });
+    const continueLesson = findContinueLesson(course, progress);
+
+    res.status(200).json({
+      success: true,
+      data: {
+        lastAccessedLessonId: progress?.lastAccessedLessonId || null,
+        continueLesson,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Get learning calendar events
+// @route   GET /api/students/calendar
+// @access  Private/Student
+exports.getLearningCalendar = async (req, res, next) => {
+  try {
+    const userId = req.user.id;
+    const user = await User.findById(userId).populate('batchId');
+    const courseQuery = buildAssignedCoursesQuery(user);
+
+    if (!courseQuery) {
+      return res.status(200).json({ success: true, data: [] });
+    }
+
+    const courses = await Course.find(courseQuery).select('_id title');
+    const courseIds = courses.map((c) => c._id);
+
+    const assessments = await Assessment.find({
+      courseId: { $in: courseIds },
+      visibility: 'published',
+      $or: [{ startDate: { $ne: null } }, { endDate: { $ne: null } }],
+    }).populate('courseId', 'title');
+
+    const announcements = await Announcement.find(buildAnnouncementFilter(user))
+      .select('title scheduledAt expiresAt createdAt pinned');
+
+    const events = [
+      ...assessments.flatMap((a) => {
+        const items = [];
+        if (a.startDate) {
+          items.push({
+            type: 'assessment_start',
+            title: `${a.title} opens`,
+            date: a.startDate,
+            courseTitle: a.courseId?.title,
+            assessmentId: a._id,
+          });
+        }
+        if (a.endDate) {
+          items.push({
+            type: 'assessment_end',
+            title: `${a.title} due`,
+            date: a.endDate,
+            courseTitle: a.courseId?.title,
+            assessmentId: a._id,
+          });
+        }
+        return items;
+      }),
+      ...announcements.map((a) => ({
+        type: 'announcement',
+        title: a.title,
+        date: a.scheduledAt || a.createdAt,
+        announcementId: a._id,
+        pinned: a.pinned,
+      })),
+    ].sort((a, b) => new Date(a.date) - new Date(b.date));
+
+    res.status(200).json({ success: true, data: events });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    List lesson bookmarks
+// @route   GET /api/students/bookmarks
+// @access  Private/Student
+exports.getBookmarks = async (req, res, next) => {
+  try {
+    const bookmarks = await LessonBookmark.find({ userId: req.user.id }).sort({ updatedAt: -1 });
+    res.status(200).json({ success: true, data: bookmarks });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Toggle lesson bookmark
+// @route   POST /api/students/bookmarks
+// @access  Private/Student
+exports.toggleBookmark = async (req, res, next) => {
+  try {
+    const userId = req.user.id;
+    const { courseId, lessonId, lessonTitle, courseTitle } = req.body;
+
+    if (!courseId || !lessonId) {
+      return res.status(400).json({ success: false, error: 'courseId and lessonId are required' });
+    }
+
+    const existing = await LessonBookmark.findOne({ userId, lessonId });
+    if (existing) {
+      await existing.deleteOne();
+      return res.status(200).json({ success: true, data: { bookmarked: false } });
+    }
+
+    await LessonBookmark.create({ userId, courseId, lessonId, lessonTitle, courseTitle });
+    res.status(201).json({ success: true, data: { bookmarked: true } });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Get/save lesson note
+// @route   GET/PUT /api/students/courses/:courseId/lessons/:lessonId/note
+// @access  Private/Student
+exports.getLessonNote = async (req, res, next) => {
+  try {
+    const { courseId, lessonId } = req.params;
+    const note = await LessonNote.findOne({ userId: req.user.id, lessonId, courseId });
+    res.status(200).json({ success: true, data: note || { content: '' } });
+  } catch (error) {
+    next(error);
+  }
+};
+
+exports.saveLessonNote = async (req, res, next) => {
+  try {
+    const { courseId, lessonId } = req.params;
+    const { content = '' } = req.body;
+
+    const note = await LessonNote.findOneAndUpdate(
+      { userId: req.user.id, lessonId, courseId },
+      { content },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
+
+    res.status(200).json({ success: true, data: note });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Get student profile summary
+// @route   GET /api/students/profile
+// @access  Private/Student
+exports.getProfile = async (req, res, next) => {
+  try {
+    const user = await User.findById(req.user.id).populate('batchId', 'name isActive').select('-password');
+    if (!user) throw new NotFoundError('User');
+
+    const preferences = await NotificationPreference.findOne({ userId: user._id });
+    const progressRows = await Progress.find({ userId: user._id });
+    const completedCourses = progressRows.filter((p) => p.completed).length;
+
+    res.status(200).json({
+      success: true,
+      data: {
+        user,
+        notificationPreferences: preferences,
+        stats: {
+          completedCourses,
+          currentStreakDays: Math.max(...progressRows.map((p) => p.currentStreakDays || 0), 0),
+        },
+      },
     });
   } catch (error) {
     next(error);

@@ -541,7 +541,10 @@ exports.getCertificateGenerationJob = async (req, res, next) => {
 // @access  Private/Student
 exports.getMyCertificates = async (req, res, next) => {
   try {
-    const certificates = await Certificate.find({ studentId: req.user.id })
+    const certificates = await Certificate.find({
+      studentId: req.user.id,
+      isRevoked: { $ne: true },
+    })
       .populate('batchId', 'name')
       .sort({ issuedAt: -1 })
       .lean();
@@ -636,6 +639,10 @@ exports.downloadCertificate = async (req, res, next) => {
 
     if (req.user.role === 'student' && certificate.studentId.toString() !== req.user.id) {
       throw new ForbiddenError('You are not authorized to download this certificate');
+    }
+
+    if (certificate.isRevoked) {
+      throw new ForbiddenError(certificate.revocationReason || 'This certificate has been revoked');
     }
 
     const absolutePath = path.join(uploadRoot, certificate.filePath);
