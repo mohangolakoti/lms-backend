@@ -29,5 +29,8 @@ const adminAuditLogSchema = new mongoose.Schema({
 }, { timestamps: true });
 
 adminAuditLogSchema.index({ createdAt: -1, action: 1 });
+adminAuditLogSchema.index({ actorId: 1, createdAt: -1 });
+// TTL: auto-expire audit logs after 90 days to prevent unbounded storage growth
+adminAuditLogSchema.index({ createdAt: 1 }, { expireAfterSeconds: 90 * 24 * 60 * 60 });
 
 module.exports = mongoose.model('AdminAuditLog', adminAuditLogSchema);

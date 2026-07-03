@@ -10,6 +10,7 @@ const Batch = require('../models/Batch');
 const CourseInstructor = require('../models/CourseInstructor');
 const AdminAuditLog = require('../models/AdminAuditLog');
 const sendEmail = require('../utils/sendEmail');
+const { enqueueEmails } = require('../utils/emailQueue');
 const { sendBatchWhatsAppMessages } = require('../utils/whatsappService');
 const logger = require('../utils/logger');
 const {
@@ -73,77 +74,25 @@ const validateCourseBatches = async (batchIds = []) => {
 // @access  Private/Admin
 exports.getDashboard = async (req, res, next) => {
   try {
-    if (dashboardCache.data && dashboardCache.expiresAt > Date.now()) {
+    // Stale-while-revalidate: serve cached data immediately and refresh in background
+    if (dashboardCache.data) {
+      const isStale = dashboardCache.expiresAt < Date.now();
+      if (isStale) {
+        // Trigger background refresh without blocking the response
+        refreshDashboardCache().catch((err) =>
+          require('../utils/logger').error('Dashboard cache refresh error', { error: err.message })
+        );
+      }
       return res.status(200).json({
         success: true,
         data: dashboardCache.data,
-        cache: { hit: true, expiresAt: new Date(dashboardCache.expiresAt).toISOString() },
+        cache: { hit: true, stale: isStale, expiresAt: new Date(dashboardCache.expiresAt).toISOString() },
       });
     }
 
-    const totalStudents = await User.countDocuments({ role: 'student' });
-    const activeStudents = await User.countDocuments({
-      role: 'student',
-      status: 'active',
-      approvalStatus: 'approved',
-      batchBlocked: { $ne: true },
-    });
-    const blockedStudents = await User.countDocuments({ role: 'student', status: 'blocked' });
-    const totalInstructors = await User.countDocuments({ role: 'instructor' });
-    const totalCourses = await Course.countDocuments();
-    const publishedCourses = await Course.countDocuments({ visibility: 'published' });
-    const draftCourses = await Course.countDocuments({ visibility: 'draft' });
-
-    // Course completion stats
-    const totalProgress = await Progress.countDocuments();
-    const completedProgress = await Progress.countDocuments({ completed: true });
-
-    // Student activity (last 30 days)
-    const thirtyDaysAgo = new Date();
-    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
-    const activeStudentsRecent = await User.countDocuments({
-      role: 'student',
-      lastLogin: { $gte: thirtyDaysAgo },
-    });
-
-    // Total time spent across all students
-    const timeSpentData = await Progress.aggregate([
-      {
-        $group: {
-          _id: null,
-          totalTimeSpent: { $sum: '$totalTimeSpent' },
-        },
-      },
-    ]);
-    const totalTimeSpent = timeSpentData[0]?.totalTimeSpent || 0;
-
-    const payload = {
-      users: {
-        totalStudents,
-        activeStudents,
-        blockedStudents,
-        totalInstructors,
-      },
-      courses: {
-        totalCourses,
-        publishedCourses,
-        draftCourses,
-      },
-      progress: {
-        totalProgress,
-        completedProgress,
-        completionRate: totalProgress > 0 ? (completedProgress / totalProgress) * 100 : 0,
-      },
-      activity: {
-        activeStudentsRecent,
-        totalTimeSpent: Math.round(totalTimeSpent / 3600), // Convert to hours
-      },
-    };
-
-    dashboardCache = {
-      data: payload,
-      expiresAt: Date.now() + DASHBOARD_CACHE_TTL_MS,
-    };
+    // No cache — fetch fresh and cache
+    const payload = await fetchDashboardData();
+    dashboardCache = { data: payload, expiresAt: Date.now() + DASHBOARD_CACHE_TTL_MS };
 
     res.status(200).json({
       success: true,
@@ -153,6 +102,58 @@ exports.getDashboard = async (req, res, next) => {
   } catch (error) {
     next(error);
   }
+};
+
+/** Fetches all dashboard stats in parallel. */
+const fetchDashboardData = async () => {
+  const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+
+  const [
+    totalStudents,
+    activeStudents,
+    blockedStudents,
+    totalInstructors,
+    totalCourses,
+    publishedCourses,
+    draftCourses,
+    totalProgress,
+    completedProgress,
+    activeStudentsRecent,
+    timeSpentData,
+  ] = await Promise.all([
+    User.countDocuments({ role: 'student' }),
+    User.countDocuments({ role: 'student', status: 'active', approvalStatus: 'approved', batchBlocked: { $ne: true } }),
+    User.countDocuments({ role: 'student', status: 'blocked' }),
+    User.countDocuments({ role: 'instructor' }),
+    Course.countDocuments(),
+    Course.countDocuments({ visibility: 'published' }),
+    Course.countDocuments({ visibility: 'draft' }),
+    Progress.countDocuments(),
+    Progress.countDocuments({ completed: true }),
+    User.countDocuments({ role: 'student', lastLogin: { $gte: thirtyDaysAgo } }),
+    Progress.aggregate([{ $group: { _id: null, totalTimeSpent: { $sum: '$totalTimeSpent' } } }]),
+  ]);
+
+  return {
+    users: { totalStudents, activeStudents, blockedStudents, totalInstructors },
+    courses: { totalCourses, publishedCourses, draftCourses },
+    progress: {
+      totalProgress,
+      completedProgress,
+      completionRate: totalProgress > 0 ? (completedProgress / totalProgress) * 100 : 0,
+    },
+    activity: {
+      activeStudentsRecent,
+      totalTimeSpent: Math.round((timeSpentData[0]?.totalTimeSpent || 0) / 3600),
+    },
+  };
+};
+
+/** Background refresh helper for stale-while-revalidate. */
+const refreshDashboardCache = async () => {
+  const payload = await fetchDashboardData();
+  dashboardCache = { data: payload, expiresAt: Date.now() + DASHBOARD_CACHE_TTL_MS };
+  return payload;
 };
 
 // @desc    Get admin operational reports
@@ -982,20 +983,28 @@ async function handleEmailDelivery(announcement, targetStudents) {
     };
   }
 
-  const emailResults = await processInBatches(
-    contactableStudents,
-    (student) => sendEmailWithRetry(student, announcement),
-    EMAIL_CONCURRENCY
-  );
-  const successCount = emailResults.filter(Boolean).length;
-  const failureCount = emailResults.length - successCount;
+  // Queue emails asynchronously for scalable, rate-controlled delivery
+  const emailJobs = contactableStudents.map((student) => ({
+    to: student.email,
+    subject: `New Announcement: ${announcement.title}`,
+    html: `
+      <h2>${announcement.title}</h2>
+      <p>Dear ${student.name},</p>
+      <p>${announcement.message}</p>
+      <p>Regards,<br>LMS Administration</p>
+    `,
+    text: announcement.message,
+    refType: 'announcement',
+    refId: announcement._id,
+  }));
 
-  logger.info(`Email: Sent to ${successCount}, Failed: ${failureCount}`);
+  const queuedCount = await enqueueEmails(emailJobs);
+  logger.info(`Email Queue: Enqueued ${queuedCount} jobs for announcement delivery`);
 
   return {
     channel: 'email',
-    sent: successCount,
-    failed: failureCount,
+    sent: queuedCount,
+    failed: 0,
     skipped_opt_out: skippedOptOut,
     skipped_no_contact: skippedNoContact,
   };

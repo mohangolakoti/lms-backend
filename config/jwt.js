@@ -10,7 +10,7 @@ if (isProduction && (!jwtSecret || !jwtRefreshSecret)) {
 module.exports = {
   jwtSecret,
   jwtRefreshSecret,
-  jwtExpire: process.env.JWT_EXPIRE || '24h',
+  jwtExpire: process.env.JWT_EXPIRE || '15m',
   jwtRefreshExpire: process.env.JWT_REFRESH_EXPIRE || '7d',
 };
 

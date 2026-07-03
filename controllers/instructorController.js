@@ -263,22 +263,24 @@ exports.getDashboard = async (req, res, next) => {
         { _id: { $in: assignedCourseIds } },
         { instructorId },
       ],
-    });
+    }).lean();
     const totalCourses = courses.length;
     const publishedCourses = courses.filter(c => c.visibility === 'published').length;
 
-    // Get student progress for instructor's courses
+    // Get student progress for instructor's courses in parallel
     const courseIds = courses.map(c => c._id);
-    const progressData = await Progress.find({ courseId: { $in: courseIds } });
+    const [progressData, draftAssessments, instructorAssessments] = await Promise.all([
+      Progress.find({ courseId: { $in: courseIds } }).lean(),
+      Assessment.countDocuments({
+        courseId: { $in: courseIds },
+        visibility: 'draft',
+      }),
+      Assessment.find({ courseId: { $in: courseIds } }).select('_id').lean(),
+    ]);
+
     const totalStudents = new Set(progressData.map(p => p.userId.toString())).size;
     const completedStudents = progressData.filter(p => p.completed).length;
 
-    const draftAssessments = await Assessment.countDocuments({
-      courseId: { $in: courseIds },
-      visibility: 'draft',
-    });
-
-    const instructorAssessments = await Assessment.find({ courseId: { $in: courseIds } }).select('_id');
     const assessmentIds = instructorAssessments.map((item) => item._id);
     const totalSubmissions = assessmentIds.length
       ? await Submission.countDocuments({ assessmentId: { $in: assessmentIds } })

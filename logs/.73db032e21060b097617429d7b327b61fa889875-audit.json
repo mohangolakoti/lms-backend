@@ -1,0 +1,20 @@
+{
+    "keep": {
+        "days": true,
+        "amount": 7
+    },
+    "auditLog": "D:\\VS Code\\LMS\\backend\\logs\\.73db032e21060b097617429d7b327b61fa889875-audit.json",
+    "files": [
+        {
+            "date": 1783012058253,
+            "name": "D:\\VS Code\\LMS\\backend\\logs\\combined-2026-07-02.log",
+            "hash": "d4d4ee75caa37cdb1e86f256fc8d80b6524733037f5ab75bf8baae25bedb14af"
+        },
+        {
+            "date": 1783024801016,
+            "name": "D:\\VS Code\\LMS\\backend\\logs\\combined-2026-07-03.log",
+            "hash": "db067352333a41e60e78541efb8e936de296e8a79f949f5b1946dedc14d19498"
+        }
+    ],
+    "hashType": "sha256"
+}

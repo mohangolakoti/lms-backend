@@ -30,5 +30,7 @@ const lessonBookmarkSchema = new mongoose.Schema(
 );
 
 lessonBookmarkSchema.index({ userId: 1, lessonId: 1 }, { unique: true });
+// Compound index for fetching all bookmarks in a course for a user
+lessonBookmarkSchema.index({ userId: 1, courseId: 1 });
 
 module.exports = mongoose.model('LessonBookmark', lessonBookmarkSchema);

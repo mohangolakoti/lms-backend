@@ -78,10 +78,10 @@ const updateActivityStreak = (progress) => {
 exports.getDashboard = async (req, res, next) => {
   try {
     const userId = req.user.id;
-    const user = await User.findById(userId).populate('batchId');
+    const user = await User.findById(userId).populate('batchId').lean();
 
     // Check if student has batchId assigned
-    if (!user.batchId) {
+    if (!user || !user.batchId) {
       return res.status(200).json({
         success: true,
         data: {
@@ -101,22 +101,26 @@ exports.getDashboard = async (req, res, next) => {
       });
     }
 
-    // Get courses assigned to student based on batch AND term
-    const courses = await Course.find({
-      $and: [
-        {
-          $or: [
-            { term: user.batch },
-            { term: 'both' },
-          ],
-        },
-        { batches: user.batchId._id },
-      ],
-      visibility: 'published',
-    }).populate('instructorId', 'name email');
-
-    // Get progress for all courses
-    const progressData = await Progress.find({ userId });
+    // Parallelize courses, progress, and submissions queries
+    const [courses, progressData, submissions] = await Promise.all([
+      Course.find({
+        $and: [
+          {
+            $or: [
+              { term: user.batch },
+              { term: 'both' },
+            ],
+          },
+          { batches: user.batchId._id },
+        ],
+        visibility: 'published',
+      })
+        .populate('instructorId', 'name email')
+        .select('title thumbnailUrl level instructorId modules')
+        .lean(),
+      Progress.find({ userId }).lean(),
+      Submission.find({ userId }).lean(),
+    ]);
 
     // Calculate dashboard metrics
     let totalTimeSpent = 0;
@@ -135,12 +139,12 @@ exports.getDashboard = async (req, res, next) => {
         totalTimeSpent += progress.totalTimeSpent || 0;
         if (progress.completed) completedCourses++;
         
-        const moduleCount = course.modules.length;
+        const moduleCount = course.modules ? course.modules.length : 0;
         totalModules += moduleCount;
         
-        const completedModuleCount = progress.moduleProgress.filter(
-          mp => mp.completionPercentage === 100
-        ).length;
+        const completedModuleCount = progress.moduleProgress
+          ? progress.moduleProgress.filter(mp => mp.completionPercentage === 100).length
+          : 0;
         completedModules += completedModuleCount;
       }
 
@@ -149,7 +153,7 @@ exports.getDashboard = async (req, res, next) => {
         title: course.title,
         thumbnailUrl: course.thumbnailUrl,
         level: course.level,
-        instructor: course.instructorId.name,
+        instructor: course.instructorId?.name || 'Unknown Instructor',
         progress: progress ? progress.overallCoursePercentage : 0,
         completed: progress ? progress.completed : false,
       };
@@ -160,16 +164,13 @@ exports.getDashboard = async (req, res, next) => {
     const assessments = await Assessment.find({
       courseId: { $in: courseIds },
       visibility: 'published',
-    });
+    }).select('_id').lean();
 
     totalAssessments = assessments.length;
-
-    // Get submissions
-    const submissions = await Submission.find({ userId });
     completedAssessments = submissions.length;
     
     submissions.forEach(submission => {
-      totalQuestionsAttempted += submission.answers.length;
+      totalQuestionsAttempted += submission.answers ? submission.answers.length : 0;
     });
 
     res.status(200).json({

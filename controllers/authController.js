@@ -11,6 +11,49 @@ const logger = require('../utils/logger');
 const ResponseHandler = require('../utils/responseHandler');
 const { ValidationError, ConflictError, NotFoundError, UnauthorizedError, ForbiddenError } = require('../utils/errors');
 
+// ---------------------------------------------------------------------------
+// Cookie helpers — dual auth strategy (HttpOnly cookie + response body bearer)
+// ---------------------------------------------------------------------------
+
+const isProduction = process.env.NODE_ENV === 'production';
+const ACCESS_TOKEN_MAX_AGE_MS = 15 * 60 * 1000;       // 15 minutes
+const REFRESH_TOKEN_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+
+/**
+ * Sets HttpOnly access and refresh token cookies on the response.
+ * These cookies are inaccessible to JavaScript (XSS-safe).
+ * The tokens are ALSO returned in the response body for backward
+ * compatibility with API clients and mobile apps.
+ */
+const setAuthCookies = (res, { token, refreshToken }) => {
+  const baseOptions = {
+    httpOnly: true,
+    secure: isProduction,       // HTTPS only in production
+    sameSite: isProduction ? 'Strict' : 'Lax', // Lax allows local dev cross-port
+    path: '/',
+  };
+
+  res.cookie('token', token, {
+    ...baseOptions,
+    maxAge: ACCESS_TOKEN_MAX_AGE_MS,
+  });
+
+  res.cookie('refreshToken', refreshToken, {
+    ...baseOptions,
+    maxAge: REFRESH_TOKEN_MAX_AGE_MS,
+    path: '/api/auth/refresh', // Restrict refresh cookie to refresh endpoint only
+  });
+};
+
+/**
+ * Clears all auth cookies (called on logout).
+ */
+const clearAuthCookies = (res) => {
+  const baseOptions = { httpOnly: true, secure: isProduction, sameSite: isProduction ? 'Strict' : 'Lax' };
+  res.clearCookie('token', { ...baseOptions, path: '/' });
+  res.clearCookie('refreshToken', { ...baseOptions, path: '/api/auth/refresh' });
+};
+
 const assertStrongPassword = (password, field = 'Password') => {
   const value = String(password || '');
   const strongPattern = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[^A-Za-z\d]).{8,64}$/;
@@ -128,6 +171,9 @@ exports.register = async (req, res, next) => {
       expiresAt: new Date(decodedRefresh.exp * 1000),
     });
 
+    // Set HttpOnly cookies (XSS-safe) AND return tokens in body (API client compat)
+    setAuthCookies(res, { token, refreshToken });
+
     return ResponseHandler.created(res, {
       token,
       refreshToken,
@@ -220,6 +266,9 @@ exports.login = async (req, res, next) => {
       expiresAt: new Date(decodedRefresh.exp * 1000),
     });
 
+    // Set HttpOnly cookies (XSS-safe) AND return tokens in body (API client compat)
+    setAuthCookies(res, { token, refreshToken });
+
     return ResponseHandler.success(res, {
       token,
       refreshToken,
@@ -244,7 +293,7 @@ exports.login = async (req, res, next) => {
 // @access  Public
 exports.refresh = async (req, res, next) => {
   try {
-    const { refreshToken } = req.body;
+    const refreshToken = req.cookies?.refreshToken || req.body.refreshToken;
 
     if (!refreshToken) {
       throw new UnauthorizedError('Refresh token is required');
@@ -301,6 +350,9 @@ exports.refresh = async (req, res, next) => {
     activeSession.expiresAt = new Date(newDecodedRefresh.exp * 1000);
     await activeSession.save();
 
+    // Rotate cookies alongside response body tokens
+    setAuthCookies(res, { token: newAccessToken, refreshToken: newRefreshToken });
+
     return ResponseHandler.success(res, {
       token: newAccessToken,
       refreshToken: newRefreshToken,
@@ -323,7 +375,7 @@ exports.refresh = async (req, res, next) => {
   }
 };
 
-// @desc    Logout user / clear cookie
+// @desc    Logout user / clear cookies and revoke sessions
 // @route   POST /api/auth/logout
 // @access  Private
 exports.logout = async (req, res, next) => {
@@ -333,6 +385,9 @@ exports.logout = async (req, res, next) => {
       { userId: req.user.id, isRevoked: false },
       { $set: { isRevoked: true, revokedAt: new Date() } }
     );
+
+    // Clear HttpOnly cookies
+    clearAuthCookies(res);
 
     res.status(200).json({
       success: true,

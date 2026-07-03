@@ -34,9 +34,14 @@ const notificationSchema = new mongoose.Schema({
   timestamps: true,
 });
 
-notificationSchema.index({ userId: 1, read: 1 });
+// Hot read path: fetch user's unread notifications sorted by date
+notificationSchema.index({ userId: 1, read: 1, createdAt: -1 });
+// Separate index for fetching all notifications for a user (read + unread)
 notificationSchema.index({ userId: 1, createdAt: -1 });
+// Announcement payload lookup (deduplication checks)
 notificationSchema.index({ 'payload.announcementId': 1 });
+// TTL: auto-expire notifications after 90 days to prevent unbounded growth
+notificationSchema.index({ createdAt: 1 }, { expireAfterSeconds: 90 * 24 * 60 * 60 });
 
 module.exports = mongoose.model('Notification', notificationSchema);
 

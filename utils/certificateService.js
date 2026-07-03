@@ -1,12 +1,21 @@
-const fs = require('fs/promises');
-const path = require('path');
 const crypto = require('crypto');
 const puppeteer = require('puppeteer');
+const { uploadFile } = require('./storageService');
 
-const uploadRoot = path.resolve(process.env.UPLOAD_PATH || './uploads');
-const certificateDir = path.join(uploadRoot, 'certificates');
-const templateDir = path.join(certificateDir, 'templates');
-const pdfDir = path.join(certificateDir, 'pdfs');
+/**
+ * Certificate generation service — production-grade version.
+ *
+ * Key change from original implementation:
+ *   OLD: Write PDF to local disk (`./uploads/certificates/pdfs/`)
+ *   NEW: Generate PDF into an in-memory Buffer, upload to Cloudflare R2.
+ *
+ * This eliminates the Railway ephemeral disk blocker — certificates are
+ * durably stored in object storage and survive container restarts/redeploys.
+ */
+
+// ---------------------------------------------------------------------------
+// Default HTML certificate template
+// ---------------------------------------------------------------------------
 
 const defaultHtmlTemplate = `
 <!doctype html>
@@ -106,12 +115,27 @@ const defaultHtmlTemplate = `
 </html>
 `;
 
-const ensureCertificateDirectories = async () => {
-  await fs.mkdir(templateDir, { recursive: true });
-  await fs.mkdir(pdfDir, { recursive: true });
+// ---------------------------------------------------------------------------
+// Template helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Replaces `{{key}}` placeholders in an HTML template string with values.
+ */
+const renderTemplate = (htmlTemplate, values) => {
+  return htmlTemplate.replace(/{{\s*([a-zA-Z0-9_]+)\s*}}/g, (_, key) => {
+    return values[key] !== undefined && values[key] !== null ? String(values[key]) : '';
+  });
 };
 
+/**
+ * Converts a local image path to a base64 data URI so it renders inside a
+ * Puppeteer page without needing a network fetch.
+ * Only used in local/development when template images are on disk.
+ */
 const toDataUri = async (absoluteImagePath) => {
+  const fs = require('fs/promises');
+  const path = require('path');
   const ext = path.extname(absoluteImagePath).toLowerCase();
   const mimeMap = {
     '.png': 'image/png',
@@ -119,83 +143,103 @@ const toDataUri = async (absoluteImagePath) => {
     '.jpeg': 'image/jpeg',
     '.webp': 'image/webp',
   };
-
   const mime = mimeMap[ext] || 'image/png';
   const fileBuffer = await fs.readFile(absoluteImagePath);
   return `data:${mime};base64,${fileBuffer.toString('base64')}`;
 };
 
-const renderTemplate = (htmlTemplate, values) => {
-  return htmlTemplate.replace(/{{\s*([a-zA-Z0-9_]+)\s*}}/g, (_, key) => {
-    return values[key] !== undefined && values[key] !== null ? String(values[key]) : '';
-  });
-};
-
 const formatCompletionDate = (dateValue) => {
   const date = dateValue ? new Date(dateValue) : new Date();
   if (Number.isNaN(date.getTime())) return new Date().toLocaleDateString();
-
-  return date.toLocaleDateString('en-GB', {
-    day: '2-digit',
-    month: 'long',
-    year: 'numeric',
-  });
+  return date.toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric' });
 };
 
+/**
+ * Generates a unique certificate number: CERT-YYYYMMDD-XXXXXX
+ */
 const buildCertificateNumber = () => {
   const datePrefix = new Date().toISOString().slice(0, 10).replace(/-/g, '');
   const suffix = crypto.randomBytes(3).toString('hex').toUpperCase();
   return `CERT-${datePrefix}-${suffix}`;
 };
 
-const buildPdfAbsolutePath = (certificateNumber) => {
-  return path.join(pdfDir, `${certificateNumber}.pdf`);
-};
+// ---------------------------------------------------------------------------
+// Puppeteer helpers
+// ---------------------------------------------------------------------------
 
-const toRelativeUploadPath = (absolutePath) => {
-  const normalized = path.normalize(absolutePath);
-  const relative = path.relative(uploadRoot, normalized);
-  return relative.split(path.sep).join('/');
-};
-
+/**
+ * Launches a Puppeteer browser instance with production-safe flags.
+ */
 const launchBrowser = async () => {
   return puppeteer.launch({
     headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox'],
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage', // Prevents crashes in low-memory containers (Railway)
+      '--disable-gpu',
+      '--no-zygote',
+    ],
   });
 };
 
-const generatePdfFromHtml = async (browser, html, outputPath) => {
+/**
+ * Generates a PDF from HTML and returns it as a Buffer (NOT written to disk).
+ *
+ * @param {object} browser - Puppeteer browser instance
+ * @param {string} html    - Complete HTML string to render
+ * @returns {Promise<Buffer>} PDF content as a Buffer
+ */
+const generatePdfBuffer = async (browser, html) => {
   const page = await browser.newPage();
   try {
     await page.setContent(html, { waitUntil: 'networkidle0' });
-    await page.pdf({
-      path: outputPath,
+    const buffer = await page.pdf({
       format: 'A4',
       landscape: true,
       printBackground: true,
-      margin: {
-        top: '0',
-        right: '0',
-        bottom: '0',
-        left: '0',
-      },
+      margin: { top: '0', right: '0', bottom: '0', left: '0' },
     });
+    return Buffer.from(buffer);
   } finally {
     await page.close();
   }
 };
 
+/**
+ * Generates a PDF from HTML and uploads it to cloud storage.
+ * Returns the public URL of the stored PDF.
+ *
+ * @param {object} browser          - Puppeteer browser instance
+ * @param {string} html             - Complete HTML string
+ * @param {string} certificateNumber - Unique certificate identifier (used as storage key)
+ * @returns {Promise<{url: string, key: string}>}
+ */
+const generateAndUploadCertificate = async (browser, html, certificateNumber) => {
+  const pdfBuffer = await generatePdfBuffer(browser, html);
+
+  const key = `certificates/${certificateNumber}.pdf`;
+  const url = await uploadFile({
+    body: pdfBuffer,
+    key,
+    mimeType: 'application/pdf',
+    cacheControl: 'public, max-age=31536000',
+  });
+
+  return { url, key };
+};
+
+// ---------------------------------------------------------------------------
+// Exports
+// ---------------------------------------------------------------------------
+
 module.exports = {
   defaultHtmlTemplate,
-  uploadRoot,
-  ensureCertificateDirectories,
-  toDataUri,
   renderTemplate,
+  toDataUri,
   formatCompletionDate,
   buildCertificateNumber,
-  buildPdfAbsolutePath,
-  toRelativeUploadPath,
   launchBrowser,
-  generatePdfFromHtml,
+  generatePdfBuffer,
+  generateAndUploadCertificate,
 };

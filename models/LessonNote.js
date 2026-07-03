@@ -27,5 +27,7 @@ const lessonNoteSchema = new mongoose.Schema(
 );
 
 lessonNoteSchema.index({ userId: 1, lessonId: 1 }, { unique: true });
+// Compound index for fetching all notes in a course for a user
+lessonNoteSchema.index({ userId: 1, courseId: 1 });
 
 module.exports = mongoose.model('LessonNote', lessonNoteSchema);
