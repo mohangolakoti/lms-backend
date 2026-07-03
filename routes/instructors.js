@@ -392,6 +392,7 @@ router.put('/assessments/:assessmentId', [
   body('moduleId').optional().isMongoId().withMessage('Invalid moduleId'),
   body('startDate').optional().isISO8601().withMessage('startDate must be valid date'),
   body('endDate').optional().isISO8601().withMessage('endDate must be valid date'),
+  body('questions').optional().isArray().withMessage('Questions must be an array'),
 ], validate, updateAssessment);
 router.delete('/assessments/:assessmentId', deleteAssessment);
 router.post('/assessments/:assessmentId/duplicate', duplicateAssessment);

@@ -639,7 +639,11 @@ exports.getAssessmentById = async (req, res, next) => {
       }
     }
 
-    const sanitizedQuestions = (assessment.questions || []).map(({ correctAnswer, ...question }) => question);
+    const sanitizedQuestions = (assessment.questions || []).map((q) => {
+      const qObj = q.toObject ? q.toObject() : q;
+      const { correctAnswer, ...rest } = qObj;
+      return rest;
+    });
 
     return res.status(200).json({
       success: true,

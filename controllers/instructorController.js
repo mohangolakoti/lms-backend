@@ -1004,8 +1004,16 @@ exports.updateAssessment = async (req, res, next) => {
       'startDate',
       'endDate',
       'moduleId',
+      'questions',
     ];
     const updates = pickAllowedFields(req.body, new Set(allowedFields));
+
+    if (updates.questions && Array.isArray(updates.questions)) {
+      updates.questions = updates.questions.map((q, index) => ({
+        ...q,
+        order: q.order !== undefined ? q.order : index,
+      }));
+    }
 
     if (updates.moduleId) {
       const moduleExists = course.modules.some((module) => module._id.toString() === updates.moduleId.toString());
