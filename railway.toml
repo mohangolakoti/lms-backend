@@ -1,9 +1,26 @@
 [build]
+# Use Nixpacks builder — it auto-detects Node.js and installs dependencies.
+# Switch to "DOCKERFILE" if you prefer the hardened multi-stage Dockerfile instead.
 builder = "NIXPACKS"
+
+# Nixpacks: Install chromium for Puppeteer PDF generation
+[build.nixpacksPlan.phases.setup]
+nixPkgs = ["chromium", "nss", "freetype", "harfbuzz", "ca-certificates", "glib", "nssmdns"]
+
+[build.nixpacksPlan.phases.build]
+cmds = ["npm ci --omit=dev"]
 
 [deploy]
 startCommand = "node index.js"
 healthcheckPath = "/health/live"
-healthcheckTimeout = 10
+healthcheckTimeout = 30
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 5
+
+# Environment variables set at the Railway project level override these.
+# Only non-secret defaults live here.
+[deploy.envVars]
+NODE_ENV = "production"
+PUPPETEER_SKIP_CHROMIUM_DOWNLOAD = "true"
+PUPPETEER_EXECUTABLE_PATH = "/nix/store/.../bin/chromium"
+LOG_LEVEL = "info"

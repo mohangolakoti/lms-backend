@@ -6,19 +6,9 @@
     "auditLog": "D:\\VS Code\\LMS\\backend\\logs\\.73db032e21060b097617429d7b327b61fa889875-audit.json",
     "files": [
         {
-            "date": 1783012058253,
-            "name": "D:\\VS Code\\LMS\\backend\\logs\\combined-2026-07-02.log",
-            "hash": "d4d4ee75caa37cdb1e86f256fc8d80b6524733037f5ab75bf8baae25bedb14af"
-        },
-        {
-            "date": 1783024801016,
-            "name": "D:\\VS Code\\LMS\\backend\\logs\\combined-2026-07-03.log",
-            "hash": "db067352333a41e60e78541efb8e936de296e8a79f949f5b1946dedc14d19498"
-        },
-        {
-            "date": 1783103418600,
-            "name": "D:\\VS Code\\LMS\\backend\\logs\\combined-2026-07-04.log",
-            "hash": "16d8584e5ed1fed986a2cb263c097d3cc00dba04a1db2f78fb216a378ae94a1d"
+            "date": 1783942942016,
+            "name": "D:\\VS Code\\LMS\\backend\\logs\\combined-2026-07-13.log",
+            "hash": "2f9cf7c5943c2f4b7ce1438f9eda29ee0f1454ecedd9a40e449126444472eeb4"
         }
     ],
     "hashType": "sha256"

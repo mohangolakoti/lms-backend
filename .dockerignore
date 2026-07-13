@@ -1,0 +1,31 @@
+# ─── Build artifacts / local tooling ───────────────────────────────────────
+node_modules/
+coverage/
+dist/
+build/
+
+# ─── Environment secrets — NEVER commit these ──────────────────────────────
+.env
+.env.local
+.env.*.local
+
+# ─── Runtime output — generated at runtime, not needed in image ────────────
+logs/
+uploads/
+
+# ─── Development / test only files — not needed in production image ─────────
+tests/
+*.test.js
+jest.config.js
+seed/
+
+# ─── Developer notes — internal only ───────────────────────────────────────
+*.md
+
+# ─── Git artifacts ──────────────────────────────────────────────────────────
+.git/
+.gitignore
+
+# ─── OS junk ────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db

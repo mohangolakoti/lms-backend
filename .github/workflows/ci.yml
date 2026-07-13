@@ -1,0 +1,47 @@
+name: Backend CI
+
+on:
+  push:
+    branches: [main, master, develop]
+  pull_request:
+    branches: [main, master, develop]
+
+jobs:
+  test:
+    name: Test & Validate
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 18
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests with coverage
+        run: npm run test:ci
+        env:
+          NODE_ENV: test
+          JWT_SECRET: ci-test-access-secret-do-not-use-in-production
+          JWT_REFRESH_SECRET: ci-test-refresh-secret-do-not-use-in-production
+          JWT_EXPIRE: 1h
+          JWT_REFRESH_EXPIRE: 7d
+          FRONTEND_URL: http://localhost:3001
+          # Puppeteer: skip Chromium download in CI (not needed for unit/integration tests)
+          PUPPETEER_SKIP_CHROMIUM_DOWNLOAD: "true"
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: backend-coverage
+          path: coverage/
+          if-no-files-found: ignore
+          retention-days: 7
